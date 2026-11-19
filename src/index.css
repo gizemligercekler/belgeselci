@@ -1,0 +1,119 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-serif: "Fraunces", Georgia, Cambria, "Times New Roman", serif;
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-canvas: #0b0f17;
+  --color-surface: #131924;
+  --color-surface-elevated: #1a2230;
+  --color-accent: #d99b26;
+  --color-accent-hover: #e8af3c;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: #0b0f17;
+    color: #e6eaf2;
+    color-scheme: dark;
+  }
+
+  h1,
+  h2,
+  .font-editorial {
+    font-family: var(--font-serif);
+    text-wrap: balance;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom subtle dark scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0b0f17;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #252f42;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #33415a;
+}
+
+/* Smooth GPU Ken Burns keyframes for Step 5 Live Preview */
+@keyframes kb-zoom-in {
+  0% {
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+  100% {
+    transform: scale(var(--kb-scale, 1.08)) translate3d(0, 0, 0);
+  }
+}
+
+@keyframes kb-zoom-out {
+  0% {
+    transform: scale(var(--kb-scale, 1.08)) translate3d(0, 0, 0);
+  }
+  100% {
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+}
+
+@keyframes kb-pan-left {
+  0% {
+    transform: scale(var(--kb-scale, 1.08)) translate3d(2.5%, 0, 0);
+  }
+  100% {
+    transform: scale(var(--kb-scale, 1.08)) translate3d(-2.5%, 0, 0);
+  }
+}
+
+@keyframes kb-pan-right {
+  0% {
+    transform: scale(var(--kb-scale, 1.08)) translate3d(-2.5%, 0, 0);
+  }
+  100% {
+    transform: scale(var(--kb-scale, 1.08)) translate3d(2.5%, 0, 0);
+  }
+}
+
+.kb-anim-zoom_in {
+  animation: kb-zoom-in var(--kb-duration, 16s) linear forwards;
+}
+
+.kb-anim-zoom_out {
+  animation: kb-zoom-out var(--kb-duration, 16s) linear forwards;
+}
+
+.kb-anim-pan_left {
+  animation: kb-pan-left var(--kb-duration, 16s) linear forwards;
+}
+
+.kb-anim-pan_right {
+  animation: kb-pan-right var(--kb-duration, 16s) linear forwards;
+}
+
+.kb-paused {
+  animation-play-state: paused !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kb-anim-zoom_in,
+  .kb-anim-zoom_out,
+  .kb-anim-pan_left,
+  .kb-anim-pan_right {
+    animation: none !important;
+  }
+}

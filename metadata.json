@@ -1,0 +1,6 @@
+{
+  "name": "Belgesel Stüdyosu",
+  "description": "30-60 dakikalık BBC tarzı YouTube belgeselleri için adım adım Türkçe senaryo, seslendirme (TTS), storyboard, canlı önizleme ve yerel FFmpeg üretim stüdyosu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
