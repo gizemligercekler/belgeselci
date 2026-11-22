@@ -37,6 +37,7 @@ export const DEFAULT_STUDIO_SETTINGS: StudioSettings = {
   chapterPauseMs: 1200,
   gentleNormalize: true,
   excludeChapterPrefix: true,
+  speakBolumTag: true,
 };
 
 export const DEFAULT_EDIT_SETTINGS: EditSettings = {

@@ -106,20 +106,28 @@ export const Step3TtsStudio: React.FC<Step3TtsStudioProps> = ({
     };
   }, [chunks]);
 
-  const runPreprocessor = async (showToast = true, overrideExcludePrefix?: boolean) => {
+  const runPreprocessor = async (
+    showToast = true,
+    overrides?: { excludeChapterPrefix?: boolean; speakBolumTag?: boolean }
+  ) => {
     if (!rawScript.trim()) {
       if (showToast) onNotify('Ön işleme için Adım 2\'de senaryo metni bulunmalıdır.', 'error');
       return;
     }
     const excludePrefix =
-      overrideExcludePrefix !== undefined
-        ? overrideExcludePrefix
+      overrides?.excludeChapterPrefix !== undefined
+        ? overrides.excludeChapterPrefix
         : studioSettings.excludeChapterPrefix;
+    const speakBolum =
+      overrides?.speakBolumTag !== undefined
+        ? overrides.speakBolumTag
+        : studioSettings.speakBolumTag ?? true;
 
     const nextChunks = await preprocessTurkishScript(
       rawScript,
       {
         excludeChapterPrefix: excludePrefix,
+        speakBolumTag: speakBolum,
         maxChunkSize: studioSettings.maxChunkSize,
         model: studioSettings.ttsModel,
         voice: studioSettings.ttsVoice,
@@ -133,6 +141,7 @@ export const Step3TtsStudio: React.FC<Step3TtsStudioProps> = ({
       studioSettings: {
         ...prev.studioSettings,
         excludeChapterPrefix: excludePrefix,
+        speakBolumTag: speakBolum,
       },
       chunks: nextChunks,
     }));
@@ -516,27 +525,50 @@ export const Step3TtsStudio: React.FC<Step3TtsStudioProps> = ({
         </div>
       </div>
 
-      {/* Studio Control Strip (Exclude Chapter Prefix + Batch Generate) */}
+      {/* Studio Control Strip (Exclude Chapter Prefix + Speak [[BOLUM]] + Batch Generate) */}
       <div className="bg-[#131924] border border-slate-800/80 rounded-2xl p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-        <label className="flex items-start gap-3 cursor-pointer max-w-2xl">
-          <input
-            type="checkbox"
-            checked={studioSettings.excludeChapterPrefix}
-            onChange={(e) => void runPreprocessor(true, e.target.checked)}
-            className="mt-1 h-4 w-4 accent-[#D99B26] rounded cursor-pointer shrink-0"
-          />
-          <div>
-            <div className="text-sm font-medium text-slate-100">
-              Bölüm ön eklerini seslendirmeden çıkar (Exclude &quot;BÖLÜM X:&quot; / &quot;BÖLÜM
-              iki:&quot;)
+        <div className="space-y-3 max-w-2xl">
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={studioSettings.excludeChapterPrefix}
+              onChange={(e) =>
+                void runPreprocessor(true, { excludeChapterPrefix: e.target.checked })
+              }
+              className="mt-1 h-4 w-4 accent-[#D99B26] rounded cursor-pointer shrink-0"
+            />
+            <div>
+              <div className="text-sm font-medium text-slate-100">
+                Bölüm ön eklerini seslendirmeden çıkar (Exclude &quot;BÖLÜM X:&quot; / &quot;BÖLÜM
+                iki:&quot;)
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {studioSettings.excludeChapterPrefix
+                  ? 'Aktif: Yalnızca bölüm başlığı okunur; rakamlı ve yazıyla yazılmış BÖLÜM ön ekleri tamamen temizlenir.'
+                  : 'Kapalı: Bölüm numaraları Türkçe sıra sayısına dönüştürülerek okunur (örn. İkinci Bölüm: ...).'}
+              </p>
             </div>
-            <p className="text-xs text-slate-400 mt-0.5">
-              {studioSettings.excludeChapterPrefix
-                ? 'Aktif: Yalnızca bölüm başlığı okunur; rakamlı ve yazıyla yazılmış BÖLÜM ön ekleri tamamen temizlenir.'
-                : 'Kapalı: Bölüm numaraları Türkçe sıra sayısına dönüştürülerek okunur (örn. İkinci Bölüm: ...).'}
-            </p>
-          </div>
-        </label>
+          </label>
+
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={studioSettings.speakBolumTag ?? true}
+              onChange={(e) => void runPreprocessor(true, { speakBolumTag: e.target.checked })}
+              className="mt-1 h-4 w-4 accent-[#D99B26] rounded cursor-pointer shrink-0"
+            />
+            <div>
+              <div className="text-sm font-medium text-slate-100">
+                [[BOLUM]] etiketindeki başlığı seslendir
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {(studioSettings.speakBolumTag ?? true)
+                  ? 'Aktif: [[BOLUM: ...]] başlığı hem ekran alt bandı olur hem seslendirilir ([[AYET]] ve [[ETIKET]] asla okunmaz).'
+                  : 'Kapalı: [[BOLUM: ...]] yalnızca görsel alt bant olarak tutulur, seslendirilmez.'}
+              </p>
+            </div>
+          </label>
+        </div>
 
         <div className="flex items-center gap-2.5 shrink-0">
           {!batch.running ? (

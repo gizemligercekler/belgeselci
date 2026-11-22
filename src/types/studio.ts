@@ -29,6 +29,7 @@ export interface StudioSettings {
   chapterPauseMs: number; // default 1200
   gentleNormalize: boolean; // default true (-16 LUFS + 10ms fade)
   excludeChapterPrefix: boolean; // default true (strip BÖLÜM X: / BÖLÜM iki:)
+  speakBolumTag: boolean; // default true (speak title inside [[BOLUM: ...]])
 }
 
 export interface TopicBrief {

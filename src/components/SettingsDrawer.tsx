@@ -410,6 +410,40 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
               </div>
             </div>
 
+            {/* OPTIONAL TOGGLE: speakBolumTag */}
+            <div className="p-4 rounded-xl bg-[#0E131D] border border-slate-800 space-y-2.5">
+              <label className="flex items-start justify-between gap-4 cursor-pointer">
+                <div>
+                  <div className="text-sm font-medium text-slate-100">
+                    [[BOLUM]] etiketindeki başlığı seslendir
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Açıkken <code className="font-mono text-slate-300">[[BOLUM: Başlık]]</code>{' '}
+                    etiketinin çerçevesi kaldırılır; başlık hem ekran alt bandı olarak kaydedilir hem
+                    de seslendirilir. Bitişik satırda aynı başlık tekrar ediyorsa iki kez okunmaz.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settings.speakBolumTag ?? true}
+                  onChange={(e) => update('speakBolumTag', e.target.checked)}
+                  className="mt-1 h-4 w-4 accent-[#D99B26] rounded cursor-pointer shrink-0"
+                />
+              </label>
+
+              <div className="text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-lg p-2.5 space-y-1">
+                <div className="text-slate-500">
+                  Girdi: [[BOLUM: GİRİŞ — ÇÖLÜN SESSİZ TANIKLARI]]
+                </div>
+                <div className="text-emerald-400">
+                  TTS Çıktısı:{' '}
+                  {(settings.speakBolumTag ?? true)
+                    ? 'GİRİŞ — ÇÖLÜN SESSİZ TANIKLARI. <short pause>'
+                    : '(Seslendirilmez — yalnızca bölüm görsel alt bandı eklenir)'}
+                </div>
+              </div>
+            </div>
+
             {/* MAX_CHUNK_SIZE */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs">

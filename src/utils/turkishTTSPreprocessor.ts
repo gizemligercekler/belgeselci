@@ -2,6 +2,7 @@ import { AudioChunk, DirectorOverlay } from '../types/studio';
 
 export interface PreprocessorOptions {
   excludeChapterPrefix: boolean;
+  speakBolumTag?: boolean; // default true
   maxChunkSize: number;
   model: string;
   voice: string;
@@ -459,6 +460,58 @@ function extractDirectorTagsFromLine(
   return { cleanedLine, overlays, bolumTitle };
 }
 
+function normalizeTitleForCompare(raw: string): string {
+  const withoutMd = raw.replace(/^\s*#{0,4}\s*/, '').replace(/\*\*|\*|__|`/g, '').trim();
+  const chMatch = withoutMd.match(CHAPTER_HEADING_REGEX);
+  const core = chMatch ? chMatch[2] : withoutMd;
+  return turkishToLower(core)
+    .replace(/[—–\-:.,!?…"“”‘’'()[\]]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function formatChapterTitleForTTS(
+  rawTitle: string,
+  excludeChapterPrefix: boolean
+): { cleanTitle: string; spokenText: string } {
+  const stripped = rawTitle.replace(/\*\*|\*|__|`/g, '').trim();
+  const chapterMatch = stripped.match(CHAPTER_HEADING_REGEX);
+
+  if (chapterMatch) {
+    const rawNum = turkishToLower(chapterMatch[1].replace(/\s+/g, ' ').trim());
+    const cleanTitle = chapterMatch[2].replace(/\*\*|\*|__|`/g, '').trim();
+    if (excludeChapterPrefix) {
+      return {
+        cleanTitle,
+        spokenText: `${ensureSentencePunctuation(convertNumbersAndSymbols(cleanTitle))} <short pause>`,
+      };
+    }
+    const numVal = /^\d+$/.test(rawNum)
+      ? parseInt(rawNum, 10)
+      : WRITTEN_CHAPTER_NUMBERS[rawNum] || 1;
+    const ordTitle = turkishTitleCase(integerToTurkishOrdinal(numVal));
+    return {
+      cleanTitle,
+      spokenText: `${ordTitle} Bölüm: ${ensureSentencePunctuation(convertNumbersAndSymbols(cleanTitle))} <short pause>`,
+    };
+  }
+
+  return {
+    cleanTitle: stripped,
+    spokenText: `${ensureSentencePunctuation(convertNumbersAndSymbols(stripped))} <short pause>`,
+  };
+}
+
+function findNextSignificantLine(lines: string[], startIndex: number): string | null {
+  for (let j = startIndex; j < lines.length; j++) {
+    const t = lines[j].trim();
+    if (!t) continue;
+    if (/^([-*_])(?:\s*\1){2,}\s*$/.test(t)) continue;
+    return t;
+  }
+  return null;
+}
+
 function splitIntoTurkishSentences(paragraph: string): string[] {
   const sentences: string[] = [];
   let current = '';
@@ -524,13 +577,19 @@ export async function computeChunkCacheHash(
   return `${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`;
 }
 
-export function cleanSingleTextBlock(raw: string, excludeChapterPrefix: boolean): string {
-  let text = raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+export function cleanSingleTextBlock(
+  raw: string,
+  excludeChapterPrefix: boolean,
+  speakBolumTag = true
+): string {
+  const text = raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   const lines = text.split('\n');
   const processedLines: string[] = [];
   const tagCounter = { count: 0 };
+  let lastSpokenChapterNorm = '';
 
-  for (const originalLine of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const originalLine = lines[i];
     const trimmed = originalLine.trim();
     if (!trimmed) {
       processedLines.push('');
@@ -540,29 +599,41 @@ export function cleanSingleTextBlock(raw: string, excludeChapterPrefix: boolean)
       continue;
     }
 
-    const { cleanedLine } = extractDirectorTagsFromLine(originalLine, 0, tagCounter);
+    const { cleanedLine, bolumTitle } = extractDirectorTagsFromLine(originalLine, 0, tagCounter);
     const lineTrimmed = cleanedLine.trim();
+
+    if (bolumTitle) {
+      const normBolum = normalizeTitleForCompare(bolumTitle);
+      const nextSig = findNextSignificantLine(lines, i + 1);
+      const nextIsSameChapterHeading = Boolean(
+        nextSig &&
+          CHAPTER_HEADING_REGEX.test(nextSig) &&
+          normalizeTitleForCompare(nextSig) === normBolum
+      );
+      const prevWasSameChapterHeading =
+        Boolean(lastSpokenChapterNorm) && lastSpokenChapterNorm === normBolum;
+
+      if (speakBolumTag && !nextIsSameChapterHeading && !prevWasSameChapterHeading) {
+        const { spokenText } = formatChapterTitleForTTS(bolumTitle, excludeChapterPrefix);
+        processedLines.push(spokenText);
+        lastSpokenChapterNorm = normBolum;
+      }
+      if (!lineTrimmed) continue;
+    }
+
     if (!lineTrimmed) continue;
 
     const chapterMatch = lineTrimmed.match(CHAPTER_HEADING_REGEX);
     if (chapterMatch) {
-      const rawNum = turkishToLower(chapterMatch[1].replace(/\s+/g, ' ').trim());
-      const title = chapterMatch[2].replace(/\*\*|\*|__|`/g, '').trim();
-      if (excludeChapterPrefix) {
-        processedLines.push(`${ensureSentencePunctuation(convertNumbersAndSymbols(title))} <short pause>`);
-      } else {
-        const numVal = /^\d+$/.test(rawNum)
-          ? parseInt(rawNum, 10)
-          : WRITTEN_CHAPTER_NUMBERS[rawNum] || 1;
-        const ordTitle = turkishTitleCase(integerToTurkishOrdinal(numVal));
-        processedLines.push(
-          `${ordTitle} Bölüm: ${ensureSentencePunctuation(convertNumbersAndSymbols(title))} <short pause>`
-        );
-      }
+      const { spokenText, cleanTitle } = formatChapterTitleForTTS(lineTrimmed, excludeChapterPrefix);
+      processedLines.push(spokenText);
+      lastSpokenChapterNorm = normalizeTitleForCompare(cleanTitle);
       continue;
     }
 
-    let cleaned = lineTrimmed
+    lastSpokenChapterNorm = '';
+
+    const cleaned = lineTrimmed
       .replace(/^>\s*/, '')
       .replace(/\*\*(.+?)\*\*/g, '$1')
       .replace(/__(.+?)__/g, '$1')
@@ -594,6 +665,8 @@ export async function preprocessTurkishScript(
   options: PreprocessorOptions,
   existingChunks: AudioChunk[] = []
 ): Promise<AudioChunk[]> {
+  const speakBolumTag = options.speakBolumTag !== false;
+
   // Rule 1: Strip BOM, normalize CRLF, remove horizontal rules
   const normalized = rawScript.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   const lines = normalized.split('\n');
@@ -609,6 +682,9 @@ export async function preprocessTurkishScript(
   let rawBufferForSection: string[] = [];
   const sectionRawTexts: string[] = [];
   const tagCounter = { count: 0 };
+  // Track if the immediately previous significant line was a chapter heading so we avoid double-reading
+  let lastHeadingNormTitle = '';
+  let sectionHasBodyProse = false;
 
   const pushCurrentSection = () => {
     if (currentSection.paragraphs.length > 0 || currentSection.overlays.length > 0) {
@@ -639,15 +715,71 @@ export async function preprocessTurkishScript(
       tagCounter
     );
 
-    if (bolumTitle && currentSection.paragraphs.length === 0) {
-      currentSection.chapterTitle = bolumTitle;
-      currentSection.isChapterStart = true;
-    }
-    if (overlays.length > 0) {
-      currentSection.overlays.push(...overlays);
+    const nonBolumOverlays = overlays.filter((o) => o.kind !== 'bolum');
+    const afterTags = cleanedLine.trim();
+
+    if (bolumTitle) {
+      const { cleanTitle, spokenText } = formatChapterTitleForTTS(
+        bolumTitle,
+        options.excludeChapterPrefix
+      );
+      const normBolum = normalizeTitleForCompare(cleanTitle);
+
+      // Deduplication Check A: Next non-empty line is already a `### BÖLÜM ...` with the same title
+      const nextSig = findNextSignificantLine(lines, i + 1);
+      const nextIsDuplicateChapterHeading = Boolean(
+        !afterTags &&
+          nextSig &&
+          CHAPTER_HEADING_REGEX.test(nextSig) &&
+          normalizeTitleForCompare(nextSig) === normBolum
+      );
+
+      // Deduplication Check B: Immediately preceding significant line was already a chapter heading with the same title
+      const prevWasDuplicateChapterHeading =
+        !sectionHasBodyProse && Boolean(lastHeadingNormTitle) && lastHeadingNormTitle === normBolum;
+
+      if (nextIsDuplicateChapterHeading || prevWasDuplicateChapterHeading) {
+        // Keep any non-bolum overlays on the line, but avoid duplicating chapter break / overlay / spoken heading
+        if (nonBolumOverlays.length > 0) {
+          currentSection.overlays.push(...nonBolumOverlays);
+        }
+        rawBufferForSection.push(line);
+        if (!afterTags) continue;
+      } else {
+        // Start a fresh chapter section ([[CHAPTER_BREAK]])
+        if (currentSection.paragraphs.length > 0 || currentSection.overlays.length > 0) {
+          pushCurrentSection();
+        }
+
+        currentSection = {
+          isChapterStart: true,
+          chapterTitle: cleanTitle,
+          paragraphs: speakBolumTag ? [spokenText] : [],
+          overlays: [
+            {
+              id: `ov_bolum_${sections.length + 1}_${tagCounter.count}`,
+              kind: 'bolum',
+              label: 'Bölüm',
+              text: cleanTitle,
+              rawTag: trimmed,
+              positionRatio: 0.04,
+            },
+            ...nonBolumOverlays,
+          ],
+        };
+        rawBufferForSection = [line];
+        lastHeadingNormTitle = normBolum;
+        sectionHasBodyProse = false;
+
+        if (!afterTags) {
+          continue;
+        }
+      }
+    } else if (nonBolumOverlays.length > 0) {
+      // [[AYET: ...]] and [[ETIKET: ...]] are NEVER spoken, only stored as visual overlay metadata
+      currentSection.overlays.push(...nonBolumOverlays);
     }
 
-    const afterTags = cleanedLine.trim();
     if (!afterTags) {
       rawBufferForSection.push(line);
       continue;
@@ -656,44 +788,46 @@ export async function preprocessTurkishScript(
     // Rule 3: Chapter heading rule (numeric AND written Turkish numbers)
     const chapterMatch = afterTags.match(CHAPTER_HEADING_REGEX);
     if (chapterMatch) {
-      pushCurrentSection();
+      const { cleanTitle, spokenText } = formatChapterTitleForTTS(
+        afterTags,
+        options.excludeChapterPrefix
+      );
+      const normHeading = normalizeTitleForCompare(cleanTitle);
 
-      const rawNum = turkishToLower(chapterMatch[1].replace(/\s+/g, ' ').trim());
-      const cleanHeadingTitle = chapterMatch[2].replace(/\*\*|\*|__|`/g, '').trim();
-
-      let spokenHeading: string;
-      if (options.excludeChapterPrefix) {
-        // Strictly omit "BÖLÜM 2:" / "BÖLÜM iki:" prefix — read ONLY title
-        spokenHeading = `${ensureSentencePunctuation(convertNumbersAndSymbols(cleanHeadingTitle))} <short pause>`;
-      } else {
-        const numVal = /^\d+$/.test(rawNum)
-          ? parseInt(rawNum, 10)
-          : WRITTEN_CHAPTER_NUMBERS[rawNum] || 1;
-        const ordTitle = turkishTitleCase(integerToTurkishOrdinal(numVal));
-        spokenHeading = `${ordTitle} Bölüm: ${ensureSentencePunctuation(convertNumbersAndSymbols(cleanHeadingTitle))} <short pause>`;
+      // Avoid double-reading if the exact same heading was just added via [[BOLUM: ...]]
+      if (!sectionHasBodyProse && lastHeadingNormTitle === normHeading) {
+        if (currentSection.paragraphs.length === 0) {
+          currentSection.paragraphs.push(spokenText);
+        }
+        rawBufferForSection.push(line);
+        continue;
       }
+
+      pushCurrentSection();
 
       currentSection = {
         isChapterStart: true,
-        chapterTitle: cleanHeadingTitle,
-        paragraphs: [spokenHeading],
+        chapterTitle: cleanTitle,
+        paragraphs: [spokenText],
         overlays: [
           {
             id: `ov_ch_${sections.length + 1}`,
             kind: 'bolum',
             label: 'Bölüm',
-            text: cleanHeadingTitle,
+            text: cleanTitle,
             rawTag: trimmed,
             positionRatio: 0.04,
           },
         ],
       };
       rawBufferForSection = [line];
+      lastHeadingNormTitle = normHeading;
+      sectionHasBodyProse = false;
       continue;
     }
 
     // Rule 4: Markdown heading cleanup + bold/italic removal
-    let cleanBody = afterTags
+    const cleanBody = afterTags
       .replace(/^>\s*/, '')
       .replace(/\*\*(.+?)\*\*/g, '$1')
       .replace(/__(.+?)__/g, '$1')
@@ -717,6 +851,7 @@ export async function preprocessTurkishScript(
     if (spokenParagraph.trim()) {
       currentSection.paragraphs.push(spokenParagraph.trim());
       rawBufferForSection.push(line);
+      sectionHasBodyProse = true;
     }
   }
 

@@ -3,6 +3,24 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      window.addEventListener(
+        'error',
+        function (event) {
+          var src = (event && event.filename) || '';
+          var msg = (event && event.message) || '';
+          if (
+            (src.indexOf('chrome-extension://') === 0 ||
+              src.indexOf('moz-extension://') === 0) &&
+            msg.indexOf('Cannot set property fetch') !== -1
+          ) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        },
+        true
+      );
+    </script>
     <title>Belgesel Stüdyosu — BBC Tarzı Belgesel Üretim Stüdyosu</title>
     <meta
       name="description"

@@ -132,6 +132,7 @@ export default function App() {
     const populated = populateDemoData(activeProject);
     const chunks = await preprocessTurkishScript(populated.rawScript, {
       excludeChapterPrefix: populated.studioSettings.excludeChapterPrefix,
+      speakBolumTag: populated.studioSettings.speakBolumTag ?? true,
       maxChunkSize: populated.studioSettings.maxChunkSize,
       model: populated.studioSettings.ttsModel,
       voice: populated.studioSettings.ttsVoice,
