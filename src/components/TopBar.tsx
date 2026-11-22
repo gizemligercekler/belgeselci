@@ -1,173 +1,148 @@
-import React, { useState } from 'react';
-import {
-  BookOpen,
-  Check,
-  FolderOpen,
-  Settings,
-  Pencil,
-} from 'lucide-react';
-import { ProjectRecord, WizardStep } from '../types/studio';
+import React from 'react';
+import { RotateCcw, Settings, Film } from 'lucide-react';
+import { WizardStep } from '../types/editor';
 
 interface TopBarProps {
-  project: ProjectRecord;
   activeStep: WizardStep;
+  canAccessStep2: boolean;
+  canAccessStep3: boolean;
+  hasAnyData: boolean;
   onSelectStep: (step: WizardStep) => void;
-  onRenameProject: (newName: string) => void;
-  onOpenProjects: () => void;
-  onOpenReadme: () => void;
   onOpenSettings: () => void;
-  completedSteps: Record<WizardStep, boolean>;
+  onResetSession: () => void;
 }
 
-const STEPS: Array<{ step: WizardStep; shortTitle: string; label: string }> = [
-  { step: 1, shortTitle: '01', label: 'Konu & Kaynaklar' },
-  { step: 2, shortTitle: '02', label: 'İskelet & Senaryo' },
-  { step: 3, shortTitle: '03', label: 'Ses Stüdyosu (TTS)' },
-  { step: 4, shortTitle: '04', label: 'Görsel & Storyboard' },
-  { step: 5, shortTitle: '05', label: 'Kurgu & Önizleme' },
-  { step: 6, shortTitle: '06', label: 'Dışa Aktar & Render' },
+const STEPS: Array<{ step: WizardStep; num: string; label: string }> = [
+  { step: 1, num: '01', label: 'Ses & Görseller' },
+  { step: 2, num: '02', label: 'Zaman Çizelgesi' },
+  { step: 3, num: '03', label: 'Dışa Aktar' },
 ];
 
 export const TopBar: React.FC<TopBarProps> = ({
-  project,
   activeStep,
+  canAccessStep2,
+  canAccessStep3,
+  hasAnyData,
   onSelectStep,
-  onRenameProject,
-  onOpenProjects,
-  onOpenReadme,
   onOpenSettings,
-  completedSteps,
+  onResetSession,
 }) => {
-  const [editingName, setEditingName] = useState(false);
-  const [draftName, setDraftName] = useState(project.name);
-
-  const commitName = () => {
-    const trimmed = draftName.trim();
-    if (trimmed && trimmed !== project.name) {
-      onRenameProject(trimmed);
-    } else {
-      setDraftName(project.name);
-    }
-    setEditingName(false);
+  const isStepClickable = (step: WizardStep) => {
+    if (step === 1) return true;
+    if (step === 2) return canAccessStep2;
+    return canAccessStep3;
   };
 
   return (
-    <div className="sticky top-0 z-30 bg-[#0B0F17]/95 backdrop-blur-md border-b border-slate-800/80">
-      {/* Primary Top Bar (3-zone contract) */}
-      <header className="max-w-[1440px] mx-auto px-6 h-16 flex items-center justify-between gap-8">
-        {/* Zone 1: Brand Wordmark */}
-        <div className="flex items-center gap-4 min-w-0 shrink-0">
-          <span className="font-editorial text-lg font-semibold tracking-tight text-[#F3F5F9] whitespace-nowrap shrink-0">
-            Belgesel Stüdyosu
-          </span>
-        </div>
+    <header className="sticky top-0 z-30 border-b border-white/[0.07] bg-[#0B0F17]/95 backdrop-blur-md">
+      <div className="mx-auto max-w-[1280px] px-4 sm:px-6">
+        <div className="flex h-14 items-center justify-between gap-4">
+          {/* Left: Minimalist Wordmark */}
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 items-center justify-center rounded-md border border-[#D99B26]/30 bg-[#D99B26]/10 text-[#D99B26]">
+              <Film className="h-4 w-4" />
+            </div>
+            <div className="flex items-baseline gap-2.5">
+              <span className="font-display text-lg font-medium tracking-tight text-[#F1F5F9]">
+                Belgesel Kurgu Asistanı
+              </span>
+              <span className="hidden text-xs text-[#64748B] sm:inline">
+                16:9 Zaman Çizelgesi &amp; Render Stüdyosu
+              </span>
+            </div>
+          </div>
 
-        {/* Zone 2: Active Project Context (Editable Title) */}
-        <div className="hidden md:flex items-center justify-center min-w-0 flex-1 max-w-md">
-          {editingName ? (
-            <input
-              type="text"
-              value={draftName}
-              onChange={(e) => setDraftName(e.target.value)}
-              onBlur={commitName}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') commitName();
-                if (e.key === 'Escape') {
-                  setDraftName(project.name);
-                  setEditingName(false);
-                }
-              }}
-              autoFocus
-              className="w-full bg-[#131924] border border-[#D99B26]/60 rounded-md px-3 py-1.5 text-sm text-slate-100 focus:outline-none"
-            />
-          ) : (
-            <button
-              type="button"
-              onClick={() => {
-                setDraftName(project.name);
-                setEditingName(true);
-              }}
-              title="Proje adını düzenle"
-              className="group flex items-center gap-2 text-sm text-slate-300 hover:text-white transition-colors truncate max-w-full px-2 py-1 rounded-md hover:bg-slate-800/50"
-            >
-              <span className="truncate">{project.name}</span>
-              <Pencil className="w-3.5 h-3.5 text-slate-500 group-hover:text-slate-300 shrink-0" />
-            </button>
-          )}
-        </div>
-
-        {/* Zone 3: Utility Actions */}
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={onOpenProjects}
-            className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-slate-300 hover:text-white hover:bg-slate-800/70 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <FolderOpen className="w-4 h-4 text-slate-400" />
-            <span>Projeler</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={onOpenReadme}
-            className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-slate-300 hover:text-white hover:bg-slate-800/70 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <BookOpen className="w-4 h-4 text-slate-400" />
-            <span className="hidden sm:inline">Kullanım Kılavuzu</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={onOpenSettings}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-[#0B0F17] bg-[#D99B26] hover:bg-[#E8AF3C] rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <Settings className="w-4 h-4" />
-            <span>Ayarlar</span>
-          </button>
-        </div>
-      </header>
-
-      {/* Horizontal 6-Step Stepper */}
-      <nav
-        aria-label="Üretim adımları"
-        className="border-t border-slate-800/60 bg-[#0E131D]/80"
-      >
-        <div className="max-w-[1440px] mx-auto px-6 overflow-x-auto">
-          <ol className="flex items-center justify-between min-w-[780px] py-2 gap-1">
-            {STEPS.map((item) => {
-              const isActive = activeStep === item.step;
-              const isDone = completedSteps[item.step];
-
+          {/* Center: Clean 3-step horizontal navigation (desktop) */}
+          <nav aria-label="Kurgu Adımları" className="hidden items-center gap-1 md:flex">
+            {STEPS.map((item, idx) => {
+              const active = activeStep === item.step;
+              const enabled = isStepClickable(item.step);
               return (
-                <li key={item.step} className="flex-1">
+                <React.Fragment key={item.step}>
                   <button
                     type="button"
-                    onClick={() => onSelectStep(item.step)}
-                    className={`w-full flex items-center justify-center gap-2.5 px-3 py-2.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
-                      isActive
-                        ? 'bg-[#1A2230] text-[#F5F7FA] ring-1 ring-[#D99B26]/50'
-                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+                    disabled={!enabled}
+                    onClick={() => enabled && onSelectStep(item.step)}
+                    className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors ${
+                      active
+                        ? 'bg-[#1A2230] text-[#F1F5F9] font-medium'
+                        : enabled
+                          ? 'text-[#94A3B8] hover:bg-white/[0.04] hover:text-[#F1F5F9]'
+                          : 'cursor-not-allowed text-[#475569]'
                     }`}
                   >
                     <span
-                      className={`font-mono tabular-nums text-[11px] flex items-center justify-center w-5 h-5 rounded-md shrink-0 ${
-                        isActive
-                          ? 'bg-[#D99B26] text-[#0B0F17] font-semibold'
-                          : isDone
-                            ? 'bg-emerald-500/15 text-emerald-400'
-                            : 'bg-slate-800/80 text-slate-400'
+                      className={`font-mono text-xs tabular-nums ${
+                        active ? 'text-[#D99B26]' : enabled ? 'text-[#64748B]' : 'text-[#334155]'
                       }`}
                     >
-                      {isDone && !isActive ? <Check className="w-3 h-3" /> : item.shortTitle}
+                      {item.num}
                     </span>
-                    <span className="truncate">{item.label}</span>
+                    <span>{item.label}</span>
                   </button>
-                </li>
+                  {idx < STEPS.length - 1 && (
+                    <span className="mx-1 h-px w-4 bg-white/[0.08]" aria-hidden="true" />
+                  )}
+                </React.Fragment>
               );
             })}
-          </ol>
+          </nav>
+
+          {/* Right: Quiet Actions */}
+          <div className="flex items-center gap-2">
+            {hasAnyData && (
+              <button
+                type="button"
+                onClick={onResetSession}
+                title="Mevcut kurguyu temizle ve yeni kurgu başlat"
+                className="flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-transparent px-2.5 py-1.5 text-xs font-medium text-[#94A3B8] transition-colors hover:border-white/[0.15] hover:bg-white/[0.04] hover:text-[#F1F5F9]"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Yeni Kurgu</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-[#131924] px-2.5 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-white/[0.16] hover:bg-[#1A2230] hover:text-[#F1F5F9]"
+            >
+              <Settings className="h-3.5 w-3.5 text-[#94A3B8]" />
+              <span>Ayarlar</span>
+            </button>
+          </div>
         </div>
-      </nav>
-    </div>
+
+        {/* Mobile Step Bar */}
+        <nav
+          aria-label="Kurgu Adımları Mobil"
+          className="flex items-center justify-between gap-1 border-t border-white/[0.05] py-2 md:hidden"
+        >
+          {STEPS.map((item) => {
+            const active = activeStep === item.step;
+            const enabled = isStepClickable(item.step);
+            return (
+              <button
+                key={item.step}
+                type="button"
+                disabled={!enabled}
+                onClick={() => enabled && onSelectStep(item.step)}
+                className={`flex flex-1 items-center justify-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors ${
+                  active
+                    ? 'bg-[#1A2230] font-medium text-[#F1F5F9]'
+                    : enabled
+                      ? 'text-[#94A3B8]'
+                      : 'cursor-not-allowed text-[#475569]'
+                }`}
+              >
+                <span className={`font-mono tabular-nums ${active ? 'text-[#D99B26]' : ''}`}>
+                  {item.num}
+                </span>
+                <span className="truncate">{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+      </div>
+    </header>
   );
 };

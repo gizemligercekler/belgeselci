@@ -23,7 +23,8 @@
 
   h1,
   h2,
-  .font-editorial {
+  .font-editorial,
+  .font-display {
     font-family: var(--font-serif);
     text-wrap: balance;
   }
@@ -33,7 +34,44 @@
   }
 }
 
-/* Custom subtle dark scrollbars */
+.studio-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #1e293b;
+  outline: none;
+  cursor: pointer;
+}
+
+.studio-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #d99b26;
+  border: 2px solid #0b0f17;
+  box-shadow: 0 0 0 1px rgba(217, 155, 38, 0.45);
+  cursor: pointer;
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+
+.studio-slider::-webkit-slider-thumb:hover {
+  background: #e8af3c;
+  transform: scale(1.1);
+}
+
+.studio-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #d99b26;
+  border: 2px solid #0b0f17;
+  box-shadow: 0 0 0 1px rgba(217, 155, 38, 0.45);
+  cursor: pointer;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -50,70 +88,4 @@
 
 ::-webkit-scrollbar-thumb:hover {
   background: #33415a;
-}
-
-/* Smooth GPU Ken Burns keyframes for Step 5 Live Preview */
-@keyframes kb-zoom-in {
-  0% {
-    transform: scale(1) translate3d(0, 0, 0);
-  }
-  100% {
-    transform: scale(var(--kb-scale, 1.08)) translate3d(0, 0, 0);
-  }
-}
-
-@keyframes kb-zoom-out {
-  0% {
-    transform: scale(var(--kb-scale, 1.08)) translate3d(0, 0, 0);
-  }
-  100% {
-    transform: scale(1) translate3d(0, 0, 0);
-  }
-}
-
-@keyframes kb-pan-left {
-  0% {
-    transform: scale(var(--kb-scale, 1.08)) translate3d(2.5%, 0, 0);
-  }
-  100% {
-    transform: scale(var(--kb-scale, 1.08)) translate3d(-2.5%, 0, 0);
-  }
-}
-
-@keyframes kb-pan-right {
-  0% {
-    transform: scale(var(--kb-scale, 1.08)) translate3d(-2.5%, 0, 0);
-  }
-  100% {
-    transform: scale(var(--kb-scale, 1.08)) translate3d(2.5%, 0, 0);
-  }
-}
-
-.kb-anim-zoom_in {
-  animation: kb-zoom-in var(--kb-duration, 16s) linear forwards;
-}
-
-.kb-anim-zoom_out {
-  animation: kb-zoom-out var(--kb-duration, 16s) linear forwards;
-}
-
-.kb-anim-pan_left {
-  animation: kb-pan-left var(--kb-duration, 16s) linear forwards;
-}
-
-.kb-anim-pan_right {
-  animation: kb-pan-right var(--kb-duration, 16s) linear forwards;
-}
-
-.kb-paused {
-  animation-play-state: paused !important;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .kb-anim-zoom_in,
-  .kb-anim-zoom_out,
-  .kb-anim-pan_left,
-  .kb-anim-pan_right {
-    animation: none !important;
-  }
 }

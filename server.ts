@@ -2,11 +2,10 @@ import 'dotenv/config';
 import express, { type Request, type Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const PORT = Number(process.env.PORT) || 3000;
 
 function resolveGeminiKey(req: Request): string {
@@ -17,30 +16,21 @@ function resolveGeminiKey(req: Request): string {
   return '';
 }
 
-function createGenAIClient(apiKey: string, apiVersion?: string): GoogleGenAI {
-  const options: {
-    apiKey: string;
-    apiVersion?: string;
-    httpOptions: { headers: Record<string, string> };
-  } = {
+function createGenAIClient(apiKey: string): GoogleGenAI {
+  return new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       },
     },
-  };
-  if (apiVersion) {
-    options.apiVersion = apiVersion;
-  }
-  return new GoogleGenAI(options);
+  });
 }
 
 function parseErrorStatus(err: unknown): { status: number; message: string; code?: string } {
   const anyErr = err as {
     status?: number;
     statusCode?: number;
-    code?: number | string;
     message?: string;
     error?: { code?: number; status?: string; message?: string };
   };
@@ -68,11 +58,11 @@ function parseErrorStatus(err: unknown): { status: number; message: string; code
 
   let friendlyTr = rawMsg;
   if (status === 429) {
-    friendlyTr = `Kota sınırına ulaşıldı (429 RESOURCE_EXHAUSTED). ${rawMsg}`;
+    friendlyTr = `Hız sınırına ulaşıldı (429 RESOURCE_EXHAUSTED). Kısa beklemenin ardından yeniden denenecek.`;
   } else if (status === 404) {
-    friendlyTr = `Seçili model bu API uç noktasında bulunamadı (404). Ayarlar'dan model adını kontrol edin (örn. gemini-3.8-flash veya gemini-4-hydrogen). Detay: ${rawMsg}`;
+    friendlyTr = `Seçili model bu uç noktada bulunamadı (404). Ayarlar'dan model adını kontrol edin (örn. gemini-3.8-flash veya gemini-4-hydrogen). Detay: ${rawMsg}`;
   } else if (status === 403 || /API_KEY_INVALID/i.test(rawMsg)) {
-    friendlyTr = `API anahtarı geçersiz veya yetkisiz (403/400). Ayarlar çekmecesindeki anahtarı veya Secrets yapılandırmasını kontrol edin.`;
+    friendlyTr = `Gemini API anahtarı geçersiz veya yetkisiz. Ayarlar'daki anahtarı veya sunucu Secrets yapılandırmasını kontrol edin.`;
   }
 
   return {
@@ -82,342 +72,280 @@ function parseErrorStatus(err: unknown): { status: number; message: string; code
   };
 }
 
+function parseTimestampToSec(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return Math.max(0, raw);
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    const parts = trimmed.split(':').map((p) => Number(p.replace(',', '.')));
+    if (parts.every((n) => Number.isFinite(n))) {
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      if (parts.length === 1) return parts[0];
+    }
+  }
+  return 0;
+}
+
+function formatMMSS(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  if (h > 0) {
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+  }
+  return `${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+}
+
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '25mb' }));
+  app.use(express.json({ limit: '30mb' }));
 
-  // Health & server fallback capability status
   app.get('/api/health', (_req: Request, res: Response) => {
     const hasGemini =
       Boolean(process.env.GEMINI_API_KEY?.trim()) &&
       process.env.GEMINI_API_KEY?.trim() !== 'MY_GEMINI_API_KEY';
-    const hasPexels = Boolean(process.env.PEXELS_API_KEY?.trim());
-    res.json({
-      ok: true,
-      hasServerGeminiKey: hasGemini,
-      hasServerPexelsKey: hasPexels,
-    });
+    res.json({ ok: true, hasServerGeminiKey: hasGemini });
   });
 
-  // 1. Text / Outline / Script / Cliché Cleaner / Storyboard Generation
-  app.post('/api/gemini/text', async (req: Request, res: Response) => {
+  // 1. Transcribe a 5-minute 16kHz mono WAV audio chunk with precise relative timestamps
+  app.post('/api/transcribe-chunk', async (req: Request, res: Response) => {
     try {
       const apiKey = resolveGeminiKey(req);
       if (!apiKey) {
         res.status(401).json({
           error:
-            'Gemini API anahtarı bulunamadı. Ayarlar çekmecesinden Free Tier / Paid Tier anahtarı ekleyin veya sunucu Secrets alanından GEMINI_API_KEY tanımlayın.',
+            'Gemini API anahtarı bulunamadı. Ayarlar penceresinden anahtar girin veya sunucu GEMINI_API_KEY değişkenini tanımlayın.',
         });
         return;
       }
 
       const {
+        audioBase64,
+        mimeType = 'audio/wav',
+        chunkDurationSec = 300,
         model = 'gemini-3.8-flash',
-        prompt,
-        systemInstruction,
-        responseMimeType,
-        responseSchema,
       } = req.body as {
+        audioBase64?: string;
+        mimeType?: string;
+        chunkDurationSec?: number;
         model?: string;
-        prompt?: string;
-        systemInstruction?: string;
-        responseMimeType?: string;
-        responseSchema?: Record<string, unknown>;
       };
 
-      if (!prompt || typeof prompt !== 'string') {
-        res.status(400).json({ error: 'Prompt metni eksik.' });
+      if (!audioBase64 || typeof audioBase64 !== 'string') {
+        res.status(400).json({ error: 'Ses parçası verisi eksik.' });
         return;
       }
 
       const ai = createGenAIClient(apiKey);
-      const config: Record<string, unknown> = {};
-      if (systemInstruction) config.systemInstruction = systemInstruction;
-      if (responseMimeType) config.responseMimeType = responseMimeType;
-      if (responseSchema) config.responseSchema = responseSchema;
+      const maxDur = Math.max(1, Number(chunkDurationSec) || 300);
+
+      const prompt = `Bu Türkçe belgesel ses kaydını tam ve eksiksiz olarak yazıya dök.
+Kurallar:
+- Her konuşma cümlesini veya 5–12 saniyelik doğal cümle öbeğini kesin zaman damgalarıyla (bu ses klibinin başından itibaren saniye cinsinden: 0.0 ile ${maxDur.toFixed(1)} arasında) listele.
+- Zaman damgaları kesinlikle artan sırada ve ses kaydındaki gerçek konuşma anlarıyla uyumlu olsun.
+- Özetleme yapma, konuşulan tüm kelimeleri ve özel isimleri (tarih, yer, yazma adları) doğru Türkçe imlayla yaz.
+- Sadece geçerli JSON döndür.`;
 
       const response = await ai.models.generateContent({
         model,
-        contents: prompt,
-        config: Object.keys(config).length > 0 ? config : undefined,
-      });
-
-      const text = response.text ?? '';
-      res.json({ text, model });
-    } catch (err) {
-      const parsed = parseErrorStatus(err);
-      res.status(parsed.status).json({ error: parsed.message, code: parsed.code });
-    }
-  });
-
-  // 2. TTS Audio Generation (v1beta + speechMetadata.style + responseModalities: ['AUDIO'])
-  app.post('/api/gemini/tts', async (req: Request, res: Response) => {
-    try {
-      const apiKey = resolveGeminiKey(req);
-      if (!apiKey) {
-        res.status(401).json({
-          error:
-            'TTS için Gemini API anahtarı bulunamadı. Ayarlar çekmecesinden en az bir anahtar ekleyin veya GEMINI_API_KEY tanımlayın.',
-        });
-        return;
-      }
-
-      const {
-        model = 'gemini-3.8-flash-tts',
-        text,
-        voiceName = 'Charon',
-        style = 'Calm, natural BBC documentary narration. Serious, warm, and understated, with a steady unhurried pace, never theatrical.',
-      } = req.body as {
-        model?: string;
-        text?: string;
-        voiceName?: string;
-        style?: string;
-      };
-
-      if (!text || !text.trim()) {
-        res.status(400).json({ error: 'Seslendirilecek metin boş olamaz.' });
-        return;
-      }
-
-      // Use v1beta as required for speechMetadata / speech_metadata & Gemini 3.8 TTS
-      const ai = createGenAIClient(apiKey, 'v1beta');
-
-      const partPayload: Record<string, unknown> = {
-        text,
-      };
-      if (style && style.trim()) {
-        partPayload.speechMetadata = { style: style.trim() };
-      }
-
-      const response = await ai.models.generateContent({
-        model,
-        contents: [
-          {
-            role: 'user',
-            parts: [partPayload as never],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType,
+                data: audioBase64,
               },
+            },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                startSec: {
+                  type: Type.NUMBER,
+                  description: 'Segment start time in seconds from start of this clip.',
+                },
+                endSec: {
+                  type: Type.NUMBER,
+                  description: 'Segment end time in seconds from start of this clip.',
+                },
+                text: {
+                  type: Type.STRING,
+                  description: 'Spoken Turkish text in this segment.',
+                },
+              },
+              required: ['startSec', 'endSec', 'text'],
             },
           },
         },
       });
 
-      const parts = response.candidates?.[0]?.content?.parts ?? [];
-      let audioBase64 = '';
-      let mimeType = 'audio/wav';
+      const rawText = (response.text ?? '[]')
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
 
-      for (const part of parts) {
-        if (part.inlineData?.data) {
-          audioBase64 = part.inlineData.data;
-          mimeType = part.inlineData.mimeType || 'audio/wav';
-          break;
+      let parsed: Array<{ startSec?: unknown; endSec?: unknown; text?: string }> = [];
+      try {
+        const obj = JSON.parse(rawText);
+        parsed = Array.isArray(obj) ? obj : Array.isArray(obj?.segments) ? obj.segments : [];
+      } catch {
+        // Fallback parser if model emitted [MM:SS - MM:SS] lines
+        const lines = rawText.split('\n');
+        for (const line of lines) {
+          const m = line.match(/\[?(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–]\s*(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*(.+)/);
+          if (m) {
+            parsed.push({
+              startSec: parseTimestampToSec(m[1]),
+              endSec: parseTimestampToSec(m[2]),
+              text: m[3].trim(),
+            });
+          }
         }
       }
 
-      if (!audioBase64) {
-        res.status(502).json({
-          error:
-            'Model ses verisi döndürmedi. Metin çok uzun olabilir veya seçili ses/model kombinasyonu yanıt vermedi.',
-        });
-        return;
-      }
+      const segments = parsed
+        .map((seg) => {
+          const start = Math.min(maxDur, Math.max(0, parseTimestampToSec(seg.startSec)));
+          const endRaw = parseTimestampToSec(seg.endSec);
+          const end = Math.min(maxDur, Math.max(start + 0.2, endRaw || start + 4));
+          return {
+            startSec: Number(start.toFixed(2)),
+            endSec: Number(end.toFixed(2)),
+            text: String(seg.text || '').trim(),
+          };
+        })
+        .filter((seg) => seg.text.length > 0)
+        .sort((a, b) => a.startSec - b.startSec);
 
-      res.json({ audioBase64, mimeType, model, voiceName });
+      res.json({ segments });
     } catch (err) {
-      const parsed = parseErrorStatus(err);
-      res.status(parsed.status).json({ error: parsed.message, code: parsed.code });
+      const parsedErr = parseErrorStatus(err);
+      res.status(parsedErr.status).json({ error: parsedErr.message, code: parsedErr.code });
     }
   });
 
-  // 3. Optional Image Generation (Nano Banana 2.1 / Gemini Image / Imagen)
-  app.post('/api/gemini/image', async (req: Request, res: Response) => {
+  // 2. Strict Sequential Image-to-Transcript Alignment
+  app.post('/api/align-images', async (req: Request, res: Response) => {
     try {
       const apiKey = resolveGeminiKey(req);
       if (!apiKey) {
         res.status(401).json({
           error:
-            'Görsel üretimi için Gemini API anahtarı bulunamadı. Ayarlar çekmecesinden ücretli/ücretsiz anahtarınızı ekleyin veya Sıfır Maliyetli Manuel Modu kullanın.',
+            'Gemini API anahtarı bulunamadı. Ayarlar penceresinden anahtar girin veya sunucu GEMINI_API_KEY değişkenini tanımlayın.',
         });
         return;
       }
 
       const {
-        model = 'gemini-nano-banana-2.1',
-        prompt,
-        aspectRatio = '16:9',
-        imageSize = '2K',
+        transcriptSegments = [],
+        images = [],
+        totalAudioDuration = 0,
+        model = 'gemini-3.8-flash',
       } = req.body as {
+        transcriptSegments?: Array<{ startSec: number; endSec: number; text: string }>;
+        images?: Array<{ orderNumber: number; filename: string; cleanTitle: string }>;
+        totalAudioDuration?: number;
         model?: string;
-        prompt?: string;
-        aspectRatio?: string;
-        imageSize?: '1K' | '2K' | '4K';
       };
 
-      if (!prompt || !prompt.trim()) {
-        res.status(400).json({ error: 'Görsel promptu boş olamaz.' });
+      if (!Array.isArray(images) || images.length === 0) {
+        res.status(400).json({ error: 'Eşleştirilecek görsel listesi boş.' });
         return;
       }
 
+      const totalDur = Math.max(2, Number(totalAudioDuration) || 60);
       const ai = createGenAIClient(apiKey);
 
-      // Support Imagen models if the user manually typed imagen-* in Settings
-      if (/^imagen-/i.test(model)) {
-        const imgResp = await ai.models.generateImages({
-          model,
-          prompt,
-          config: {
-            numberOfImages: 1,
-            aspectRatio,
-            outputMimeType: 'image/png',
-          },
-        });
-        const imgBytes = imgResp.generatedImages?.[0]?.image?.imageBytes;
-        if (!imgBytes) {
-          res.status(502).json({ error: 'Imagen modeli görsel döndürmedi.' });
-          return;
-        }
-        res.json({ imageBase64: imgBytes, mimeType: 'image/png', model });
-        return;
-      }
+      const transcriptText = transcriptSegments
+        .map((s) => `[${formatMMSS(s.startSec)} - ${formatMMSS(s.endSec)}] (${s.startSec.toFixed(1)}s) ${s.text}`)
+        .join('\n');
 
-      // Nano Banana / Gemini image models via generateContent
-      const supportsImageSize = /nano-banana-2\.1|3-pro-image/i.test(model);
-      const imageConfig: Record<string, string> = { aspectRatio };
-      if (supportsImageSize && imageSize) {
-        imageConfig.imageSize = imageSize;
-      }
+      const imageListText = images
+        .map((img, idx) => `${idx + 1}. Sıra #${img.orderNumber} | Dosya: ${img.filename} | Konu Başlığı: ${img.cleanTitle}`)
+        .join('\n');
+
+      const prompt = `Sen profesyonel bir Türkçe belgesel kurgu yönetmenisin.
+Aşağıda bir belgeselin tam zaman damgalı Türkçe transkripti (toplam süre: ${totalDur.toFixed(2)} saniye) ve sayısal sıraya dizilmiş ${images.length} adet görselin listesi var.
+
+Görevin: Her görseli, anlatıcının o görselin konusundan bahsetmeye başladığı TAM başlangıç saniyesine (startSec) yerleştirmek.
+
+KESİN KURALLAR:
+1. Görsellerin sırası ASLA değişmez. Listede verilen 1'den ${images.length}'e kadar sırayla eşleştir.
+2. İlk görsel (index 0) KESİNLİKLE 0.0 saniyede başlamalıdır.
+3. Her görsel i, kendinden önceki görsel i-1'den KESİNLİKLE daha sonra başlamalıdır (startSec[i] > startSec[i-1], aralarında en az 2.0 saniye olacak şekilde).
+4. Tüm startSec değerleri 0.0 ile ${(totalDur - 2).toFixed(2)} arasında olmalıdır.
+5. Anlatıcının transkriptte dosya başlığıyla (cleanTitle) anlamsal olarak en net örtüştüğü cümlenin tam başlangıç saniyesini seç. Eğer bir görselin konusu transkriptte açık geçmiyorsa, önceki ve sonraki görsel arasına doğal bir cümle başlangıcına orantılı yerleştir.
+6. Her görsel için transkriptten eşleşen kısa alıntıyı (matchedExcerpt, en fazla 140 karakter) ekle.
+
+GÖRSEL LİSTESİ (${images.length} adet):
+${imageListText}
+
+ZAMAN DAMGALI TRANSKRİPT:
+${transcriptText || '(Transkript metni boş; görselleri toplam süreye eşit dağıt.)'}
+
+Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
 
       const response = await ai.models.generateContent({
         model,
-        contents: {
-          parts: [{ text: prompt }],
-        },
+        contents: prompt,
         config: {
-          imageConfig,
-        } as never,
-      });
-
-      const parts = response.candidates?.[0]?.content?.parts ?? [];
-      let imageBase64 = '';
-      let mimeType = 'image/png';
-
-      for (const part of parts) {
-        if (part.inlineData?.data) {
-          imageBase64 = part.inlineData.data;
-          mimeType = part.inlineData.mimeType || 'image/png';
-          break;
-        }
-      }
-
-      if (!imageBase64) {
-        res.status(502).json({
-          error:
-            'Model görsel verisi döndürmedi. Prompt güvenlik filtresine takılmış veya seçili model görsel desteklemiyor olabilir.',
-        });
-        return;
-      }
-
-      res.json({ imageBase64, mimeType, model });
-    } catch (err) {
-      const parsed = parseErrorStatus(err);
-      res.status(parsed.status).json({ error: parsed.message, code: parsed.code });
-    }
-  });
-
-  // 4. Pexels 16:9 Stock Video Search Proxy
-  app.get('/api/pexels/search', async (req: Request, res: Response) => {
-    try {
-      const pexelsKey =
-        req.header('x-pexels-api-key')?.trim() || process.env.PEXELS_API_KEY?.trim() || '';
-
-      if (!pexelsKey) {
-        res.status(400).json({
-          error:
-            'Pexels API anahtarı tanımlı değil. Ayarlar çekmecesinden ücretsiz Pexels API anahtarınızı ekleyebilirsiniz (pexels.com/api).',
-        });
-        return;
-      }
-
-      const query = String(req.query.q || '').trim();
-      if (!query) {
-        res.status(400).json({ error: 'Arama sorgusu boş olamaz.' });
-        return;
-      }
-
-      const url = new URL('https://api.pexels.com/videos/search');
-      url.searchParams.set('query', query);
-      url.searchParams.set('orientation', 'landscape');
-      url.searchParams.set('per_page', '8');
-
-      const upstream = await fetch(url.toString(), {
-        headers: {
-          Authorization: pexelsKey,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                index: {
+                  type: Type.INTEGER,
+                  description: '0-based index matching the input image list order.',
+                },
+                filename: {
+                  type: Type.STRING,
+                  description: 'Exact filename from input list.',
+                },
+                startSec: {
+                  type: Type.NUMBER,
+                  description: 'Exact start timestamp in seconds.',
+                },
+                matchedExcerpt: {
+                  type: Type.STRING,
+                  description: 'Short matched Turkish transcript excerpt around startSec.',
+                },
+              },
+              required: ['index', 'startSec', 'matchedExcerpt'],
+            },
+          },
         },
       });
 
-      if (!upstream.ok) {
-        const errText = await upstream.text();
-        res.status(upstream.status).json({
-          error: `Pexels API hatası (${upstream.status}): ${errText.slice(0, 180)}`,
-        });
-        return;
-      }
+      const rawText = (response.text ?? '[]')
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
 
-      const data = (await upstream.json()) as {
-        videos?: Array<{
-          id: number;
-          width: number;
-          height: number;
-          duration: number;
-          image: string;
-          url: string;
-          user?: { name?: string };
-          video_files?: Array<{
-            id: number;
-            quality: string;
-            file_type: string;
-            width: number;
-            height: number;
-            link: string;
-          }>;
-        }>;
-      };
+      const parsed = JSON.parse(rawText) as Array<{
+        index?: number;
+        filename?: string;
+        startSec?: number;
+        matchedExcerpt?: string;
+      }>;
 
-      const videos = (data.videos ?? []).map((v) => {
-        const mp4Files = (v.video_files ?? []).filter((f) => f.file_type === 'video/mp4');
-        const sorted = [...mp4Files].sort((a, b) => (b.width || 0) - (a.width || 0));
-        const hd = sorted.find((f) => f.width <= 1920 && f.width >= 1280) || sorted[0];
-        const preview = sorted.find((f) => f.width <= 960) || sorted[sorted.length - 1] || hd;
-
-        return {
-          id: v.id,
-          duration: v.duration,
-          width: v.width,
-          height: v.height,
-          thumbnail: v.image,
-          pexelsUrl: v.url,
-          author: v.user?.name || 'Pexels',
-          videoUrl: hd?.link || '',
-          previewUrl: preview?.link || hd?.link || '',
-        };
-      });
-
-      res.json({ videos });
+      res.json({ alignments: Array.isArray(parsed) ? parsed : [] });
     } catch (err) {
-      res.status(500).json({
-        error: `Pexels araması sırasında bağlantı hatası: ${(err as Error).message}`,
-      });
+      const parsedErr = parseErrorStatus(err);
+      res.status(parsedErr.status).json({ error: parsedErr.message, code: parsedErr.code });
     }
   });
 
-  // Vite middleware in dev, static dist in production
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -434,7 +362,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Belgesel Stüdyosu sunucusu http://0.0.0.0:${PORT} adresinde hazır.`);
+    console.log(`Belgesel Kurgu Asistanı sunucusu http://0.0.0.0:${PORT} adresinde hazır.`);
   });
 }
 
