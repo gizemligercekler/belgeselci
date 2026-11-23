@@ -26,11 +26,12 @@ import {
   TranscribeProgress,
   transcribeAudioInChunks,
 } from './services/editorApi';
-import { TopBar } from './components/TopBar';
+import { AppView, TopBar } from './components/TopBar';
 import { SettingsModal } from './components/SettingsModal';
 import { Step1Upload } from './components/Step1Upload';
 import { Step2Timeline } from './components/Step2Timeline';
 import { Step3Export } from './components/Step3Export';
+import { StandaloneTranscriber } from './components/StandaloneTranscriber';
 
 const STORAGE_KEY = 'belgesel_kurgu_asistani_v1';
 
@@ -53,6 +54,7 @@ export default function App() {
   const saved = initial.current;
   const hasSavedTimeline = Boolean(saved?.scenes && saved.scenes.length > 0);
 
+  const [activeView, setActiveView] = useState<AppView>('editor');
   const [activeStep, setActiveStep] = useState<WizardStep>(
     hasSavedTimeline ? 2 : 1
   );
@@ -472,20 +474,51 @@ export default function App() {
     audioFileName || srtFileName || images.length > 0 || scenes.length > 0
   );
 
+  const handleUseStandaloneTranscriptInEditor = (
+    extractedSegments: TranscriptSegment[],
+    sourceSrtName: string,
+    sourceAudioFile: File | null,
+    durationSec: number
+  ) => {
+    setSrtFileName(sourceSrtName);
+    setSrtSegments(extractedSegments);
+    if (sourceAudioFile) {
+      void handleSelectAudio(sourceAudioFile);
+    } else if (durationSec > 0) {
+      setTotalAudioDuration(Number(durationSec.toFixed(2)));
+    }
+    setActiveStep(1);
+    setActiveView('editor');
+  };
+
   return (
     <div className="flex min-h-screen flex-col bg-[#0B0F17] text-[#F1F5F9]">
       <TopBar
+        activeView={activeView}
         activeStep={activeStep}
         canAccessStep2={canAccessStep2}
         canAccessStep3={canAccessStep3}
         hasAnyData={hasAnyData}
-        onSelectStep={setActiveStep}
+        onSelectStep={(step) => {
+          setActiveView('editor');
+          setActiveStep(step);
+        }}
+        onSelectTranscribeView={() => setActiveView('transcribe')}
         onOpenSettings={() => setSettingsOpen(true)}
         onResetSession={() => setResetConfirmOpen(true)}
       />
 
       <main className="flex-1 pb-12">
-        {activeStep === 1 && (
+        <div className={activeView === 'transcribe' ? 'block' : 'hidden'}>
+          <StandaloneTranscriber
+            settings={settings}
+            hasDeepgramKey={hasDeepgramKey}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onUseTranscriptInEditor={handleUseStandaloneTranscriptInEditor}
+          />
+        </div>
+
+        {activeView === 'editor' && activeStep === 1 && (
           <Step1Upload
             audioFile={audioFile}
             audioFileName={audioFileName}
@@ -511,7 +544,7 @@ export default function App() {
           />
         )}
 
-        {activeStep === 2 && (
+        {activeView === 'editor' && activeStep === 2 && (
           <Step2Timeline
             audioFileName={audioFileName}
             audioObjectUrl={audioObjectUrl}
@@ -536,7 +569,7 @@ export default function App() {
           />
         )}
 
-        {activeStep === 3 && (
+        {activeView === 'editor' && activeStep === 3 && (
           <Step3Export
             audioFileName={audioFileName}
             totalAudioDuration={totalAudioDuration}
