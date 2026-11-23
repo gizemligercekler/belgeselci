@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Play,
   Pause,
@@ -14,6 +14,11 @@ import {
   Lock,
   Upload,
   Image as ImageIcon,
+  Maximize2,
+  Minimize2,
+  Subtitles,
+  RefreshCw,
+  AlertCircle,
 } from 'lucide-react';
 import {
   FIXED_DISSOLVE_SEC,
@@ -29,16 +34,24 @@ import {
 } from '../utils/timelineMath';
 import { segmentsToSrt } from '../utils/mediaUtils';
 import { downloadTextFile } from '../utils/exportBundle';
+import { RetryNotice } from '../services/editorApi';
 
 interface Step2TimelineProps {
   audioFileName: string;
   audioObjectUrl: string | null;
   totalAudioDuration: number;
   zoomSpeedPerSec: number;
+  burnSubtitles: boolean;
+  alignmentModelUsed: string;
+  isRealigning: boolean;
+  realignRetryNotice: RetryNotice | null;
+  realignError: string | null;
   transcriptSegments: TranscriptSegment[];
   scenes: TimelineScene[];
   images: UploadedImage[];
   onChangeZoomSpeed: (nextSpeed: number) => void;
+  onToggleSubtitles: (enabled: boolean) => void;
+  onRealignWithHydrogen: () => void;
   onAdjustSceneDuration: (sceneIndex: number, newDurationSec: number) => void;
   onToggleZoomDirection: (sceneIndex: number) => void;
   onReattachAudio: (file: File) => void;
@@ -60,6 +73,18 @@ function findSceneIndexAtTime(scenes: TimelineScene[], t: number): number {
   return scenes.length - 1;
 }
 
+function findSubtitleAtTime(segments: TranscriptSegment[], t: number): string {
+  if (segments.length === 0) return '';
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (t >= seg.startSec && t <= seg.endSec + 0.15) {
+      return seg.text;
+    }
+    if (seg.startSec > t) break;
+  }
+  return '';
+}
+
 function evalScaleAtTime(scene: TimelineScene, t: number): number {
   const elapsed = Math.max(0, t - scene.startSec);
   const denom = Math.max(0.1, scene.renderDurationSec);
@@ -72,10 +97,17 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
   audioObjectUrl,
   totalAudioDuration,
   zoomSpeedPerSec,
+  burnSubtitles,
+  alignmentModelUsed,
+  isRealigning,
+  realignRetryNotice,
+  realignError,
   transcriptSegments,
   scenes,
   images,
   onChangeZoomSpeed,
+  onToggleSubtitles,
+  onRealignWithHydrogen,
   onAdjustSceneDuration,
   onToggleZoomDirection,
   onReattachAudio,
@@ -83,6 +115,7 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
   onProceedToExport,
 }) => {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const playerWrapperRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastFrameTsRef = useRef<number | null>(null);
   const reattachAudioInputRef = useRef<HTMLInputElement>(null);
@@ -91,6 +124,7 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
   const [playheadSec, setPlayheadSec] = useState(0);
   const [showTranscript, setShowTranscript] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [editingDraft, setEditingDraft] = useState<Record<string, string>>({});
 
   // Map filename -> objectUrl for instant preview lookup
@@ -108,6 +142,48 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
     () => scenes.filter((sc) => !imageUrlByFilename.has(sc.filename)).length,
     [scenes, imageUrlByFilename]
   );
+
+  // Sync native browser fullscreen exit (e.g. pressing Esc in native fullscreen)
+  useEffect(() => {
+    const onFsChange = () => {
+      if (!document.fullscreenElement) {
+        setIsFullscreen(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+
+  const enterFullscreen = useCallback(async () => {
+    setIsFullscreen(true);
+    const el = playerWrapperRef.current;
+    if (el && typeof el.requestFullscreen === 'function') {
+      try {
+        await el.requestFullscreen();
+      } catch {
+        // Iframe policy may block native Fullscreen API; full-viewport Cinema Overlay stays active seamlessly.
+      }
+    }
+  }, []);
+
+  const exitFullscreen = useCallback(async () => {
+    setIsFullscreen(false);
+    if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    if (isFullscreen) {
+      void exitFullscreen();
+    } else {
+      void enterFullscreen();
+    }
+  }, [isFullscreen, enterFullscreen, exitFullscreen]);
 
   // Sync playhead via requestAnimationFrame when playing
   useEffect(() => {
@@ -131,7 +207,6 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
           return;
         }
       } else {
-        // Fallback visual clock if audio file was not re-attached after page reload
         if (lastFrameTsRef.current !== null) {
           const dt = (now - lastFrameTsRef.current) / 1000;
           setPlayheadSec((prev) => {
@@ -165,23 +240,26 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
     };
   }, []);
 
-  const seekTo = (sec: number, autoPlay?: boolean) => {
-    const clamped = clamp(sec, 0, Math.max(0, totalAudioDuration - 0.05));
-    setPlayheadSec(clamped);
-    const el = audioRef.current;
-    if (el && audioObjectUrl) {
-      el.currentTime = clamped;
-      if (autoPlay) {
-        el.play()
-          .then(() => setIsPlaying(true))
-          .catch(() => setIsPlaying(false));
+  const seekTo = useCallback(
+    (sec: number, autoPlay?: boolean) => {
+      const clamped = clamp(sec, 0, Math.max(0, totalAudioDuration - 0.05));
+      setPlayheadSec(clamped);
+      const el = audioRef.current;
+      if (el && audioObjectUrl) {
+        el.currentTime = clamped;
+        if (autoPlay) {
+          el.play()
+            .then(() => setIsPlaying(true))
+            .catch(() => setIsPlaying(false));
+        }
+      } else if (autoPlay) {
+        setIsPlaying(true);
       }
-    } else if (autoPlay) {
-      setIsPlaying(true);
-    }
-  };
+    },
+    [audioObjectUrl, totalAudioDuration]
+  );
 
-  const togglePlayPause = () => {
+  const togglePlayPause = useCallback(() => {
     const el = audioRef.current;
     if (isPlaying) {
       el?.pause();
@@ -199,7 +277,7 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
       setPlayheadSec(startPos);
       setIsPlaying(true);
     }
-  };
+  }, [isPlaying, playheadSec, totalAudioDuration, audioObjectUrl]);
 
   // Compute active scene & optional 1.0-second dissolve transition layer (1:1 with render.py)
   const activeIdx = findSceneIndexAtTime(scenes, playheadSec);
@@ -223,11 +301,41 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
   const activeImgUrl = activeScene ? imageUrlByFilename.get(activeScene.filename) : undefined;
   const prevImgUrl = prevScene ? imageUrlByFilename.get(prevScene.filename) : undefined;
 
-  const handleStepScene = (delta: number) => {
-    if (scenes.length === 0) return;
-    const nextIdx = clamp((activeIdx < 0 ? 0 : activeIdx) + delta, 0, scenes.length - 1);
-    seekTo(scenes[nextIdx].startSec, isPlaying);
-  };
+  const activeSubtitleText = useMemo(() => {
+    if (!burnSubtitles || transcriptSegments.length === 0) return '';
+    return findSubtitleAtTime(transcriptSegments, playheadSec);
+  }, [burnSubtitles, transcriptSegments, playheadSec]);
+
+  const handleStepScene = useCallback(
+    (delta: number) => {
+      if (scenes.length === 0) return;
+      const nextIdx = clamp((activeIdx < 0 ? 0 : activeIdx) + delta, 0, scenes.length - 1);
+      seekTo(scenes[nextIdx].startSec, isPlaying);
+    },
+    [scenes, activeIdx, seekTo, isPlaying]
+  );
+
+  // Keyboard shortcuts while in Full Screen (Esc exit, Space play/pause, Arrows prev/next scene)
+  useEffect(() => {
+    if (!isFullscreen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        void exitFullscreen();
+      } else if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        togglePlayPause();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        handleStepScene(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        handleStepScene(1);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isFullscreen, exitFullscreen, togglePlayPause, handleStepScene]);
 
   const handleDownloadSrt = () => {
     if (transcriptSegments.length === 0) return;
@@ -468,75 +576,139 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
         </div>
       )}
 
-      {/* LIVE 16:9 PREVIEW PLAYER */}
-      <section className="overflow-hidden rounded-lg border border-white/[0.08] bg-[#131924]">
-        <div className="mx-auto max-w-[920px] p-4 pb-3 sm:p-5 sm:pb-4">
-          {/* 16:9 Stage */}
-          <div className="relative aspect-video w-full overflow-hidden rounded-md border border-white/[0.08] bg-[#05070B]">
-            {/* Previous Clip (underneath during exact 1.0s dissolve overlap, still smoothly zooming) */}
-            {isInDissolve && prevScene && prevImgUrl && (
-              <img
-                src={prevImgUrl}
-                alt={prevScene.cleanTitle}
-                className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover will-change-transform"
-                style={{
-                  transform: `scale(${prevScale.toFixed(5)})`,
-                  opacity: 1,
-                }}
-              />
-            )}
+      {/* LIVE 16:9 PREVIEW PLAYER (Supports Hybrid Native + Cinema Viewport Full Screen & Live Optional Subtitles) */}
+      <section
+        ref={playerWrapperRef}
+        className={
+          isFullscreen
+            ? 'fixed inset-0 z-50 flex flex-col justify-between bg-black p-3 sm:p-5'
+            : 'overflow-hidden rounded-lg border border-white/[0.08] bg-[#131924]'
+        }
+      >
+        <div
+          className={
+            isFullscreen
+              ? 'mx-auto flex h-full w-full max-w-[1680px] flex-col justify-between gap-3'
+              : 'mx-auto max-w-[920px] p-4 pb-3 sm:p-5 sm:pb-4'
+          }
+        >
+          {/* 16:9 Stage Container */}
+          <div
+            className={
+              isFullscreen
+                ? 'flex min-h-0 flex-1 items-center justify-center'
+                : 'w-full'
+            }
+          >
+            <div
+              onDoubleClick={toggleFullscreen}
+              className={`relative aspect-video overflow-hidden bg-[#05070B] ${
+                isFullscreen
+                  ? 'max-h-full w-auto max-w-full rounded-sm border border-white/[0.08]'
+                  : 'w-full rounded-md border border-white/[0.08]'
+              }`}
+              style={isFullscreen ? { width: 'min(100%, calc((100vh - 128px) * 16 / 9))' } : undefined}
+            >
+              {/* Previous Clip (underneath during exact 1.0s dissolve overlap, still smoothly zooming) */}
+              {isInDissolve && prevScene && prevImgUrl && (
+                <img
+                  src={prevImgUrl}
+                  alt={prevScene.cleanTitle}
+                  className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover will-change-transform"
+                  style={{
+                    transform: `scale(${prevScale.toFixed(5)})`,
+                    opacity: 1,
+                  }}
+                />
+              )}
 
-            {/* Active Clip (fades in 0 -> 1 over the first 1.0s dissolve overlap while zooming linearly) */}
-            {activeScene && activeImgUrl ? (
-              <img
-                src={activeImgUrl}
-                alt={activeScene.cleanTitle}
-                className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover will-change-transform"
-                style={{
-                  transform: `scale(${activeScale.toFixed(5)})`,
-                  opacity: isInDissolve ? dissolveProgress : 1,
-                }}
-              />
-            ) : (
-              <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-[#64748B]">
-                <ImageIcon className="h-8 w-8 opacity-40" />
-                <p className="text-xs">
-                  {activeScene
-                    ? `${activeScene.filename} önizleme için yerel görsel bekleniyor`
-                    : 'Önizlenecek görsel yok'}
-                </p>
-              </div>
-            )}
-
-            {/* Subtle Bottom Overlay Bar on Stage */}
-            {activeScene && (
-              <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/30 to-transparent px-4 pb-3 pt-10">
-                <div className="flex items-end justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="truncate font-mono text-xs text-[#F1F5F9]">
-                      <span className="text-[#D99B26]">#{activeScene.orderNumber}</span>{' '}
-                      <span>{activeScene.filename}</span>
-                    </p>
-                    <p className="mt-0.5 truncate text-xs text-[#CBD5E1]/90">
-                      {activeScene.matchedExcerpt}
-                    </p>
-                  </div>
-                  <div className="shrink-0 text-right font-mono text-[11px] tabular-nums text-[#CBD5E1]">
-                    <span>
-                      {activeScene.zoomDirection === 'uzaklas' ? 'Uzaklaş' : 'Yakınlaş'} ·{' '}
-                      {formatPct(activeScale)}
-                    </span>
-                    {isInDissolve && (
-                      <span className="ml-2 text-[#D99B26]">· 1.0s Dissolve</span>
-                    )}
-                  </div>
+              {/* Active Clip (fades in 0 -> 1 over the first 1.0s dissolve overlap while zooming linearly) */}
+              {activeScene && activeImgUrl ? (
+                <img
+                  src={activeImgUrl}
+                  alt={activeScene.cleanTitle}
+                  className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover will-change-transform"
+                  style={{
+                    transform: `scale(${activeScale.toFixed(5)})`,
+                    opacity: isInDissolve ? dissolveProgress : 1,
+                  }}
+                />
+              ) : (
+                <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-[#64748B]">
+                  <ImageIcon className="h-8 w-8 opacity-40" />
+                  <p className="text-xs">
+                    {activeScene
+                      ? `${activeScene.filename} önizleme için yerel görsel bekleniyor`
+                      : 'Önizlenecek görsel yok'}
+                  </p>
                 </div>
-              </div>
-            )}
+              )}
+
+              {/* Subtle Top-Left Scene HUD (stays out of the way of bottom subtitles) */}
+              {activeScene && (
+                <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-2 rounded bg-black/55 px-2.5 py-1 backdrop-blur-sm">
+                  <span className="font-mono text-[11px] font-semibold tabular-nums text-[#D99B26]">
+                    #{activeScene.orderNumber}
+                  </span>
+                  <span className="max-w-[220px] truncate font-mono text-[11px] text-[#F1F5F9] sm:max-w-[340px]">
+                    {activeScene.filename}
+                  </span>
+                  <span className="hidden font-mono text-[11px] tabular-nums text-[#94A3B8] sm:inline">
+                    · {activeScene.zoomDirection === 'uzaklas' ? 'Uzaklaş' : 'Yakınlaş'}{' '}
+                    {formatPct(activeScale)}
+                  </span>
+                  {isInDissolve && (
+                    <span className="font-mono text-[11px] text-[#D99B26]">· Dissolve</span>
+                  )}
+                </div>
+              )}
+
+              {/* Top-Right Quick Full Screen Button */}
+              <button
+                type="button"
+                onClick={toggleFullscreen}
+                title={isFullscreen ? 'Tam ekrandan çık (Esc)' : 'Tam ekran izle (Çift tıkla)'}
+                className="absolute right-3 top-3 flex items-center gap-1.5 rounded bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-[#E2E8F0] backdrop-blur-sm transition-colors hover:bg-black/80 hover:text-white"
+              >
+                {isFullscreen ? (
+                  <>
+                    <Minimize2 className="h-3.5 w-3.5 text-[#D99B26]" />
+                    <span>Küçült</span>
+                  </>
+                ) : (
+                  <>
+                    <Maximize2 className="h-3.5 w-3.5 text-[#D99B26]" />
+                    <span className="hidden sm:inline">Tam Ekran</span>
+                  </>
+                )}
+              </button>
+
+              {/* Optional Live Synchronized Turkish Subtitles (Matches render.py styling) */}
+              {burnSubtitles && activeSubtitleText && (
+                <div className="pointer-events-none absolute inset-x-4 bottom-5 flex justify-center sm:inset-x-10 sm:bottom-7">
+                  <p
+                    className={`max-w-[85%] rounded bg-black/75 px-3.5 py-1.5 text-center font-medium leading-snug text-white shadow-lg ${
+                      isFullscreen ? 'text-lg sm:text-2xl' : 'text-xs sm:text-base'
+                    }`}
+                  >
+                    {activeSubtitleText}
+                  </p>
+                </div>
+              )}
+
+              {/* Non-subtitle Bottom Excerpt Hint (only shown when subtitles are OFF and not fullscreen) */}
+              {!burnSubtitles && !isFullscreen && activeScene && (
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 via-black/25 to-transparent px-4 pb-3 pt-8">
+                  <p className="truncate text-xs text-[#CBD5E1]/90">
+                    {activeScene.matchedExcerpt}
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Transport & Scrub Bar */}
-          <div className="mt-3.5 flex flex-col gap-2.5">
+          <div className={`flex flex-col gap-2.5 ${isFullscreen ? 'shrink-0 pt-1' : 'mt-3.5'}`}>
             <div className="flex items-center gap-3">
               <span className="w-12 shrink-0 font-mono text-xs tabular-nums text-[#F1F5F9]">
                 {formatMMSS(playheadSec)}
@@ -556,7 +728,7 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
               </span>
             </div>
 
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
@@ -593,10 +765,42 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
                 </button>
               </div>
 
-              <p className="hidden truncate font-mono text-[11px] text-[#64748B] sm:block">
-                {audioFileName}
-                {!audioObjectUrl ? ' (Sessiz önizleme — sesi tekrar bağlayın)' : ''}
-              </p>
+              <div className="flex items-center gap-2">
+                {/* Optional Subtitle Toggle (Live Preview + Render Export) */}
+                <button
+                  type="button"
+                  disabled={transcriptSegments.length === 0}
+                  onClick={() => onToggleSubtitles(!burnSubtitles)}
+                  title="Canlı önizleme ve dışa aktarılan videoda isteğe bağlı Türkçe altyazıyı aç/kapat"
+                  className={`flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                    burnSubtitles
+                      ? 'border-[#D99B26]/60 bg-[#D99B26]/15 text-[#F1F5F9]'
+                      : 'border-white/[0.08] bg-[#0B0F17] text-[#94A3B8] hover:border-white/[0.18] hover:text-[#F1F5F9]'
+                  }`}
+                >
+                  <Subtitles className={`h-3.5 w-3.5 ${burnSubtitles ? 'text-[#D99B26]' : ''}`} />
+                  <span>Altyazı: {burnSubtitles ? 'Açık' : 'Kapalı'}</span>
+                </button>
+
+                {/* Full Screen Toggle */}
+                <button
+                  type="button"
+                  onClick={toggleFullscreen}
+                  className="flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9]"
+                >
+                  {isFullscreen ? (
+                    <>
+                      <Minimize2 className="h-3.5 w-3.5 text-[#D99B26]" />
+                      <span>Tam Ekrandan Çık</span>
+                    </>
+                  ) : (
+                    <>
+                      <Maximize2 className="h-3.5 w-3.5 text-[#D99B26]" />
+                      <span>Tam Ekran</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -604,19 +808,58 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
 
       {/* IMAGE TIMELINE LIST */}
       <section className="overflow-hidden rounded-lg border border-white/[0.08] bg-[#131924]">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.07] px-5 py-3.5">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.07] px-5 py-3.5">
           <div>
-            <h2 className="text-sm font-medium text-[#F1F5F9]">
-              Görsel Zaman Çizelgesi
-            </h2>
-            <p className="text-xs text-[#64748B]">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <h2 className="text-sm font-medium text-[#F1F5F9]">
+                Görsel Zaman Çizelgesi
+              </h2>
+              {alignmentModelUsed && (
+                <span className="font-mono text-[11px] text-[#64748B]">
+                  · Eşleştirme modeli:{' '}
+                  <span className="text-[#CBD5E1]">{alignmentModelUsed}</span>
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 text-xs text-[#64748B]">
               Bir görselin süresini değiştirdiğinizde yalnızca hemen arkasındaki görselin başlangıcı güncellenir; sonraki tüm görseller sabit kalır.
             </p>
           </div>
-          <span className="font-mono text-[11px] tabular-nums text-[#94A3B8]">
-            Sıralı · Boşluksuz · Çakışmasız
-          </span>
+
+          <div className="flex items-center gap-2">
+            {transcriptSegments.length > 0 && (
+              <button
+                type="button"
+                disabled={isRealigning}
+                onClick={onRealignWithHydrogen}
+                title="Mevcut transkripti yeniden çıkarmadan yalnızca görselleri gemini-4-hydrogen ile tekrar eşleştir"
+                className="flex items-center gap-1.5 rounded-md border border-white/[0.1] bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9] disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 text-[#D99B26] ${isRealigning ? 'animate-spin' : ''}`} />
+                <span>
+                  {isRealigning ? 'Eşleştiriliyor...' : 'Hydrogen ile Yeniden Eşleştir'}
+                </span>
+              </button>
+            )}
+          </div>
         </div>
+
+        {/* Optional Re-alignment Status / Error Strip */}
+        {(realignRetryNotice || realignError) && (
+          <div className="border-b border-white/[0.06] bg-[#0B0F17]/80 px-5 py-2.5 text-xs">
+            {realignRetryNotice && (
+              <p className="font-mono tabular-nums text-[#D99B26]">
+                {realignRetryNotice.reason} — {realignRetryNotice.secondsLeft} saniye sonra yeniden denenecek...
+              </p>
+            )}
+            {realignError && (
+              <div className="flex items-start gap-2 text-rose-300">
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-400" />
+                <span>{realignError}</span>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="divide-y divide-white/[0.06]">
           {scenes.map((scene, idx) => {

@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import { TranscriptSegment, UploadedImage } from '../types/editor';
 import { formatMMSS } from '../utils/timelineMath';
-import { TranscribeProgress } from '../services/editorApi';
+import { RetryNotice, TranscribeProgress } from '../services/editorApi';
 
 interface Step1UploadProps {
   audioFile: File | null;
@@ -24,7 +24,7 @@ interface Step1UploadProps {
   srtSegments: TranscriptSegment[];
   isProcessing: boolean;
   progress: TranscribeProgress | null;
-  retryWaitSec: number | null;
+  retryNotice: RetryNotice | null;
   errorMessage: string | null;
   hasExistingTimeline: boolean;
   onSelectAudio: (file: File) => void;
@@ -48,7 +48,7 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
   srtSegments,
   isProcessing,
   progress,
-  retryWaitSec,
+  retryNotice,
   errorMessage,
   hasExistingTimeline,
   onSelectAudio,
@@ -69,14 +69,24 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
   const [audioDragOver, setAudioDragOver] = useState(false);
   const [imagesDragOver, setImagesDragOver] = useState(false);
 
-  const hasAudioReady = totalAudioDuration > 0 && Boolean(audioFile || (srtSegments.length > 0 && audioFileName));
-  const canProcess = !isProcessing && hasAudioReady && images.length > 0 && Boolean(audioFile || srtSegments.length > 0);
+  const needsAudioReattach = Boolean(audioFileName && !audioFile && srtSegments.length === 0);
+  const hasSourceReady =
+    totalAudioDuration > 0 && Boolean(audioFile || srtSegments.length > 0);
+  const isReadyToProcess = hasSourceReady && images.length > 0;
+
+  const handleAudioOrSrtFile = (file: File) => {
+    if (/\.srt$/i.test(file.name)) {
+      onUploadSrt(file);
+    } else {
+      onSelectAudio(file);
+    }
+  };
 
   const handleAudioDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setAudioDragOver(false);
     const file = e.dataTransfer.files?.[0];
-    if (file) onSelectAudio(file);
+    if (file) handleAudioOrSrtFile(file);
   };
 
   const handleImagesDrop = (e: React.DragEvent) => {
@@ -132,9 +142,9 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-sm font-medium text-[#F1F5F9]">
                 <FileAudio className="h-4 w-4 text-[#D99B26]" />
-                <span>Belgesel Ses Dosyası</span>
+                <span>Ses Dosyası veya .SRT Transkript</span>
               </div>
-              <span className="font-mono text-[11px] text-[#64748B]">MP3 · WAV · M4A</span>
+              <span className="font-mono text-[11px] text-[#64748B]">MP3 · WAV · M4A · SRT</span>
             </div>
 
             {/* Dropzone */}
@@ -149,7 +159,7 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               className={`group flex min-h-[180px] cursor-pointer flex-col items-center justify-center rounded-md border border-dashed p-6 text-center transition-colors ${
                 audioDragOver
                   ? 'border-[#D99B26] bg-[#D99B26]/[0.06]'
-                  : audioFileName
+                  : audioFileName || srtSegments.length > 0
                     ? 'border-white/[0.14] bg-[#0B0F17]/70 hover:border-white/[0.24]'
                     : 'border-white/[0.12] bg-[#0B0F17]/50 hover:border-[#D99B26]/50 hover:bg-[#0B0F17]'
               }`}
@@ -157,11 +167,11 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               <input
                 ref={audioInputRef}
                 type="file"
-                accept=".mp3,.wav,.m4a,.aac,.flac,audio/*"
+                accept=".mp3,.wav,.m4a,.aac,.flac,.srt,audio/*"
                 className="hidden"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
-                  if (file) onSelectAudio(file);
+                  if (file) handleAudioOrSrtFile(file);
                   e.target.value = '';
                 }}
               />
@@ -179,8 +189,8 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
                       Toplam Süre: {formatMMSS(totalAudioDuration)} ({totalAudioDuration.toFixed(1)} sn)
                     </p>
                     {!audioFile && (
-                      <p className="text-[11px] text-[#94A3B8]">
-                        Önizleme veya yeniden transkript için ses dosyasını tekrar seçebilirsiniz.
+                      <p className="rounded border border-[#D99B26]/30 bg-[#D99B26]/10 px-2.5 py-1 text-[11px] font-medium text-[#E5AA38]">
+                        Sayfa yenilendi — transkript çıkarmak için bu ses dosyasını tıklayıp tekrar seçin.
                       </p>
                     )}
                   </div>
@@ -207,10 +217,14 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
                   </div>
                   <div className="space-y-1">
                     <p className="text-sm font-medium text-[#E2E8F0]">
-                      Ses dosyasını sürükleyip bırakın
+                      {srtSegments.length > 0
+                        ? 'İsteğe bağlı olarak ses dosyasını da ekleyebilirsiniz'
+                        : 'Ses dosyasını veya hazır .SRT dosyasını buraya bırakın'}
                     </p>
                     <p className="text-xs text-[#64748B]">
-                      veya bilgisayarınızdan seçmek için tıklayın
+                      {srtSegments.length > 0
+                        ? 'Ses yüklemeden de doğrudan .SRT ile devam edebilirsiniz'
+                        : 'Ses yüklemeden yalnızca .SRT + görsellerle de çalışır'}
                     </p>
                   </div>
                 </div>
@@ -266,16 +280,16 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
             ) : (
               <div className="flex items-center justify-between gap-3">
                 <span className="text-xs text-[#64748B]">
-                  Hazır zaman damgalı metniniz varsa:
+                  Ses yerine doğrudan hazır transkript yüklemek için:
                 </span>
                 <button
                   type="button"
                   disabled={isProcessing}
                   onClick={() => srtInputRef.current?.click()}
-                  className="flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-transparent px-2.5 py-1.5 text-xs text-[#94A3B8] transition-colors hover:border-white/[0.16] hover:bg-white/[0.04] hover:text-[#F1F5F9] disabled:opacity-50"
+                  className="flex items-center gap-1.5 rounded-md border border-white/[0.12] bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9] disabled:opacity-50"
                 >
-                  <FileText className="h-3.5 w-3.5" />
-                  <span>Opsiyonel .SRT Yükle</span>
+                  <FileText className="h-3.5 w-3.5 text-[#D99B26]" />
+                  <span>.SRT Yükle</span>
                 </button>
               </div>
             )}
@@ -448,9 +462,9 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               </button>
             </div>
 
-            {retryWaitSec !== null && (
+            {retryNotice !== null && (
               <p className="font-mono text-xs tabular-nums text-[#D99B26]">
-                Free Tier hız sınırı (429) algılandı — {retryWaitSec} saniye sonra otomatik yeniden denenecek...
+                {retryNotice.reason} — {retryNotice.secondsLeft} saniye sonra otomatik yeniden denenecek...
               </p>
             )}
 
@@ -462,8 +476,8 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
             </div>
 
             <p className="text-xs text-[#64748B]">
-              Uzun belgesellerde zaman kaymasını önlemek için ses 5 dakikalık hafif 16kHz WAV parçalarına bölünür ve
-              kota koruması için parçalar arasında 2 saniye beklenir.
+              Uzun belgesellerde zaman kaymasını önlemek için ses 5 dakikalık 16kHz mono WAV parçalarına
+              bölünür ve Deepgram ile sırayla çözümlenir (parçalar arası 1 sn bekleme).
             </p>
           </div>
         ) : (
@@ -472,20 +486,32 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               <p className="font-medium text-[#CBD5E1]">
                 {srtSegments.length > 0
                   ? 'Hazır .SRT yüklü — doğrudan görseller zaman çizelgesine eşleştirilecek.'
-                  : '5 dakikalık parçalama ile drift-free Türkçe transkript + sıralı görsel eşleştirme.'}
+                  : '5 dakikalık 16kHz WAV ile Deepgram Türkçe transkript + sıralı görsel eşleştirme.'}
               </p>
               <p className="font-mono text-[11px] tabular-nums text-[#64748B]">
-                {audioFileName
-                  ? `Ses: ${formatMMSS(totalAudioDuration)} · Görsel: ${images.length} adet`
-                  : 'Başlamak için 1 ses dosyası ve en az 1 görsel seçin.'}
+                {needsAudioReattach ? (
+                  <span className="text-[#D99B26]">
+                    Ses dosyasını tekrar seçin ({audioFileName}) · Görsel: {images.length} adet
+                  </span>
+                ) : audioFileName ? (
+                  `Ses: ${formatMMSS(totalAudioDuration)} · Görsel: ${images.length} adet`
+                ) : srtSegments.length > 0 ? (
+                  `SRT: ${formatMMSS(totalAudioDuration)} (${srtSegments.length} satır) · Görsel: ${images.length} adet`
+                ) : (
+                  'Başlamak için 1 ses veya .SRT dosyası ve en az 1 görsel seçin.'
+                )}
               </p>
             </div>
 
             <button
               type="button"
-              disabled={!canProcess}
+              disabled={isProcessing}
               onClick={onStartProcess}
-              className="flex w-full items-center justify-center gap-2 rounded-md bg-[#D99B26] px-5 py-2.5 text-sm font-semibold text-[#0B0F17] transition-colors hover:bg-[#E5AA38] disabled:cursor-not-allowed disabled:bg-[#1E293B] disabled:text-[#64748B] sm:w-auto"
+              className={`flex w-full items-center justify-center gap-2 rounded-md px-5 py-2.5 text-sm font-semibold transition-colors sm:w-auto ${
+                isReadyToProcess
+                  ? 'bg-[#D99B26] text-[#0B0F17] hover:bg-[#E5AA38] cursor-pointer'
+                  : 'border border-white/[0.12] bg-[#1E293B] text-[#CBD5E1] hover:border-[#D99B26]/40 hover:text-[#F1F5F9] cursor-pointer'
+              }`}
             >
               <span>
                 {srtSegments.length > 0

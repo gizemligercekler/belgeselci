@@ -4,12 +4,13 @@ import {
   TranscriptSegment,
   UploadedImage,
 } from '../types/editor';
-import { sliceAudioInto5MinWavChunks } from '../utils/mediaUtils';
+import { sliceAudioIntoWavChunks } from '../utils/mediaUtils';
 import { buildValidatedTimeline, round2 } from '../utils/timelineMath';
 
 export interface ServerHealth {
   ok: boolean;
   hasServerGeminiKey: boolean;
+  hasDeepgramKey: boolean;
 }
 
 export interface TranscribeProgress {
@@ -19,21 +20,41 @@ export interface TranscribeProgress {
   message: string;
 }
 
-export interface ApiCallOptions {
-  signal?: AbortSignal;
-  onRetryWait?: (secondsLeft: number | null) => void;
+export interface RetryNotice {
+  secondsLeft: number;
+  reason: string;
 }
 
-const INTER_CHUNK_DELAY_MS = 2000;
-const RETRY_DELAYS_SEC = [15, 25, 35];
+export interface ApiCallOptions {
+  signal?: AbortSignal;
+  onRetryWait?: (notice: RetryNotice | null) => void;
+}
+
+const DEEPGRAM_INTER_CHUNK_DELAY_MS = 1000;
+const DEEPGRAM_FALLBACK_RETRY_DELAYS_SEC = [10, 15, 25, 30, 45];
+const GEMINI_ALIGN_RETRY_DELAYS_SEC = [8, 18, 30];
+
+// In-memory resume cache keyed by file signature + deepgramModel
+// so completed chunks are NEVER wasted if a later chunk pauses or is retried.
+const completedChunksCache = new Map<string, Map<number, TranscriptSegment[]>>();
+
+export function clearTranscriptionCache(): void {
+  completedChunksCache.clear();
+}
 
 export async function fetchServerHealth(): Promise<ServerHealth> {
   try {
-    const res = await fetch('/api/health');
-    if (!res.ok) return { ok: false, hasServerGeminiKey: false };
-    return (await res.json()) as ServerHealth;
+    const res = await fetch('/api/health', { credentials: 'same-origin' });
+    if (!res.ok) return { ok: false, hasServerGeminiKey: false, hasDeepgramKey: false };
+    const text = await res.text();
+    const parsed = JSON.parse(text) as Partial<ServerHealth>;
+    return {
+      ok: Boolean(parsed.ok),
+      hasServerGeminiKey: Boolean(parsed.hasServerGeminiKey),
+      hasDeepgramKey: Boolean(parsed.hasDeepgramKey),
+    };
   } catch {
-    return { ok: false, hasServerGeminiKey: false };
+    return { ok: false, hasServerGeminiKey: false, hasDeepgramKey: false };
   }
 }
 
@@ -59,70 +80,189 @@ export function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> 
 
 async function countdownRetryWait(
   totalSeconds: number,
+  reason: string,
   options?: ApiCallOptions
 ): Promise<void> {
-  for (let remaining = totalSeconds; remaining > 0; remaining--) {
-    options?.onRetryWait?.(remaining);
+  const secs = Math.max(1, Math.ceil(totalSeconds));
+  for (let remaining = secs; remaining > 0; remaining--) {
+    options?.onRetryWait?.({ secondsLeft: remaining, reason });
     await sleepWithAbort(1000, options?.signal);
   }
   options?.onRetryWait?.(null);
 }
 
-async function postJsonWith429Retry<T>(
-  url: string,
-  payload: unknown,
-  settings: EditorSettings,
-  options?: ApiCallOptions
-): Promise<T> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (settings.customApiKey.trim()) {
-    headers['x-gemini-api-key'] = settings.customApiKey.trim();
-  }
+interface SingleAttemptResult<T> {
+  ok: true;
+  data: T;
+}
 
-  let attempt = 0;
-  while (true) {
-    if (options?.signal?.aborted) {
+interface SingleAttemptFail {
+  ok: false;
+  retryable: boolean;
+  isQuotaOrBusy: boolean;
+  retryAfterSec?: number;
+  reason: string;
+  errorMessage: string;
+}
+
+async function runSingleFetch<T>(
+  url: string,
+  init: RequestInit,
+  label: string,
+  signal?: AbortSignal
+): Promise<SingleAttemptResult<T> | SingleAttemptFail> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...init,
+      credentials: 'same-origin',
+      signal,
+    });
+  } catch (netErr) {
+    if ((netErr as { name?: string })?.name === 'AbortError' || signal?.aborted) {
       throw new DOMException('İşlem kullanıcı tarafından iptal edildi.', 'AbortError');
     }
+    return {
+      ok: false,
+      retryable: true,
+      isQuotaOrBusy: false,
+      reason: `Ağ bağlantısı kesildi (${label})`,
+      errorMessage: `Sunucuya ulaşılamadı (Failed to fetch · ${label}). İnternet bağlantınızı kontrol edip tekrar deneyin.`,
+    };
+  }
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: options?.signal,
-    });
+  const rawText = await res.text();
+  const looksLikeHtml = /^\s*<!doctype\s+html|^\s*<html/i.test(rawText);
 
-    if (res.ok) {
-      options?.onRetryWait?.(null);
-      return (await res.json()) as T;
+  if (looksLikeHtml) {
+    return {
+      ok: false,
+      retryable: true,
+      isQuotaOrBusy: true,
+      reason: 'Sunucu geçici olarak meşgul (HTML yanıtı)',
+      errorMessage:
+        'Sunucudan geçici olarak JSON yerine HTML yanıtı döndü. Birkaç saniye sonra tekrar deneyin.',
+    };
+  }
+
+  let parsedBody: Record<string, unknown> | null = null;
+  try {
+    parsedBody = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+  } catch {
+    parsedBody = null;
+  }
+
+  if (res.ok && parsedBody !== null) {
+    return { ok: true, data: parsedBody as T };
+  }
+
+  const errMsg =
+    (typeof parsedBody?.error === 'string' && parsedBody.error) ||
+    `Sunucu hatası (${res.status})`;
+  const isQuotaOrBusy =
+    res.status === 429 ||
+    res.status === 502 ||
+    res.status === 503 ||
+    res.status === 504 ||
+    parsedBody?.retryable === true;
+
+  const rawRetryAfter = Number(parsedBody?.retryAfterSec);
+  const retryAfterSec =
+    Number.isFinite(rawRetryAfter) && rawRetryAfter > 0
+      ? Math.ceil(rawRetryAfter)
+      : undefined;
+
+  const upstream = Number(parsedBody?.upstreamStatus || res.status);
+  const reason =
+    upstream === 503 || upstream === 502 || upstream === 504
+      ? `Sunucu geçici olarak yoğun (${upstream})`
+      : 'Hız sınırına ulaşıldı (429)';
+
+  return {
+    ok: false,
+    retryable: isQuotaOrBusy,
+    isQuotaOrBusy,
+    retryAfterSec,
+    reason,
+    errorMessage: errMsg,
+  };
+}
+
+/**
+ * Sends a Gemini alignment request with automatic Free Tier model failover
+ * (gemini-4-hydrogen -> gemini-3.8-flash -> gemini-3.1-flash-lite) and countdown retries.
+ */
+async function sendWithModelFailover<T>(
+  url: string,
+  modelChain: string[],
+  startModelIndex: number,
+  initForModel: (model: string) => RequestInit,
+  label: string,
+  options?: ApiCallOptions & { onModelSwitch?: (newModel: string) => void }
+): Promise<{ data: T; usedModelIndex: number }> {
+  let round = 0;
+  let currentIdx = startModelIndex;
+  let lastError = 'İstek başarısız oldu.';
+
+  while (true) {
+    for (let offset = 0; offset < modelChain.length; offset++) {
+      const idx = (currentIdx + offset) % modelChain.length;
+      const model = modelChain[idx];
+
+      if (options?.signal?.aborted) {
+        throw new DOMException('İşlem kullanıcı tarafından iptal edildi.', 'AbortError');
+      }
+
+      if (offset > 0) {
+        options?.onModelSwitch?.(model);
+      }
+
+      const result = await runSingleFetch<T>(url, initForModel(model), `${label} · ${model}`, options?.signal);
+
+      if (result.ok) {
+        options?.onRetryWait?.(null);
+        return { data: result.data, usedModelIndex: idx };
+      }
+
+      lastError = result.errorMessage;
+
+      if (!result.retryable) {
+        options?.onRetryWait?.(null);
+        throw new Error(result.errorMessage);
+      }
+
+      if (result.isQuotaOrBusy && offset < modelChain.length - 1) {
+        await sleepWithAbort(1500, options?.signal);
+        continue;
+      }
+
+      if (!result.isQuotaOrBusy) {
+        break;
+      }
     }
 
-    let errMsg = `Sunucu hatası (${res.status})`;
-    try {
-      const errBody = (await res.json()) as { error?: string };
-      if (errBody?.error) errMsg = errBody.error;
-    } catch {
-      // keep fallback message
-    }
-
-    if (res.status === 429 && attempt < RETRY_DELAYS_SEC.length) {
-      const waitSec = RETRY_DELAYS_SEC[attempt];
-      attempt += 1;
-      await countdownRetryWait(waitSec, options);
+    if (round < GEMINI_ALIGN_RETRY_DELAYS_SEC.length) {
+      const waitSec = GEMINI_ALIGN_RETRY_DELAYS_SEC[round];
+      round += 1;
+      await countdownRetryWait(
+        waitSec,
+        `Gemini eşleştirme kotası/yoğunluğu (429/503) — yeniden deneme ${round}/${GEMINI_ALIGN_RETRY_DELAYS_SEC.length}`,
+        options
+      );
       continue;
     }
 
     options?.onRetryWait?.(null);
-    throw new Error(errMsg);
+    throw new Error(
+      `${lastError} (Tüm yedek Gemini modeller de denendi. Kısa süre bekleyip tekrar deneyebilir veya Ayarlar'dan kendi Gemini API anahtarınızı girebilirsiniz.)`
+    );
   }
 }
 
 /**
- * Slices the user's audio in browser into lightweight 5-minute (300s) 16kHz mono WAV chunks,
- * sends each chunk sequentially with a 2-second inter-chunk delay and automatic 429 countdown retry,
- * and applies exact +chunk.offsetSec to every timestamp for drift-free accuracy.
+ * Slices the user's audio in browser into 5-minute (300s) 16kHz mono binary WAV chunks (~9.6 MB),
+ * sends each chunk sequentially to Deepgram Pre-Recorded Audio API with 1s polite pacing,
+ * automatic 429 retry-after countdown, and per-chunk resume cache.
  */
 export async function transcribeAudioInChunks(
   audioFile: File,
@@ -130,10 +270,10 @@ export async function transcribeAudioInChunks(
   callbacks: {
     signal?: AbortSignal;
     onProgress?: (progress: TranscribeProgress) => void;
-    onRetryWait?: (secondsLeft: number | null) => void;
+    onRetryWait?: (notice: RetryNotice | null) => void;
   }
 ): Promise<TranscriptSegment[]> {
-  const chunks = await sliceAudioInto5MinWavChunks(audioFile, 300, (msg) => {
+  const chunks = await sliceAudioIntoWavChunks(audioFile, 300, (msg) => {
     callbacks.onProgress?.({
       phase: 'decoding',
       currentChunk: 0,
@@ -142,7 +282,14 @@ export async function transcribeAudioInChunks(
     });
   });
 
-  const allSegments: TranscriptSegment[] = [];
+  const deepgramModel = settings.deepgramModel === 'nova-2' ? 'nova-2' : 'nova-3';
+
+  const fileKey = `${audioFile.name}:${audioFile.size}:${audioFile.lastModified}:${deepgramModel}`;
+  let fileCache = completedChunksCache.get(fileKey);
+  if (!fileCache) {
+    fileCache = new Map<number, TranscriptSegment[]>();
+    completedChunksCache.set(fileKey, fileCache);
+  }
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
@@ -150,81 +297,179 @@ export async function transcribeAudioInChunks(
       throw new DOMException('Transkript işlemi iptal edildi.', 'AbortError');
     }
 
+    // Reuse already-completed chunks so user never wastes credit or time on retry
+    if (fileCache.has(chunk.chunkIndex)) {
+      callbacks.onProgress?.({
+        phase: 'transcribing',
+        currentChunk: chunk.chunkIndex,
+        totalChunks: chunk.totalChunks,
+        message: `Deepgram (${deepgramModel}) ile transkript çıkarılıyor: Parça ${chunk.chunkIndex}/${chunk.totalChunks} (önbellekten)...`,
+      });
+      continue;
+    }
+
     callbacks.onProgress?.({
       phase: 'transcribing',
       currentChunk: chunk.chunkIndex,
       totalChunks: chunk.totalChunks,
-      message: `Parça ${chunk.chunkIndex}/${chunk.totalChunks} transkript çıkarılıyor...`,
+      message: `Deepgram (${deepgramModel}) ile transkript çıkarılıyor: Parça ${chunk.chunkIndex}/${chunk.totalChunks}...`,
     });
 
-    const data = await postJsonWith429Retry<{ segments: TranscriptSegment[] }>(
-      '/api/transcribe-chunk',
-      {
-        audioBase64: chunk.wavBase64,
-        mimeType: 'audio/wav',
-        chunkDurationSec: chunk.durationSec,
-        model: settings.model.trim() || 'gemini-3.8-flash',
-      },
-      settings,
-      {
-        signal: callbacks.signal,
-        onRetryWait: callbacks.onRetryWait,
-      }
-    );
+    const headers: Record<string, string> = {
+      'Content-Type': 'audio/wav',
+      'x-chunk-offset': String(chunk.offsetSec),
+      'x-chunk-duration': String(chunk.durationSec),
+      'x-deepgram-model': deepgramModel,
+    };
+    if (settings.deepgramApiKey.trim()) {
+      headers['x-deepgram-api-key'] = settings.deepgramApiKey.trim();
+    }
 
-    const chunkSegments = Array.isArray(data.segments) ? data.segments : [];
-    for (const seg of chunkSegments) {
-      const startSec = round2(chunk.offsetSec + Math.max(0, Number(seg.startSec) || 0));
-      const endSec = round2(
-        chunk.offsetSec + Math.max(Number(seg.startSec) + 0.2, Number(seg.endSec) || 0)
+    let attempt = 0;
+    let chunkData: { segments: TranscriptSegment[] } | null = null;
+
+    while (true) {
+      if (callbacks.signal?.aborted) {
+        throw new DOMException('Transkript işlemi iptal edildi.', 'AbortError');
+      }
+
+      const wavCopy = new Uint8Array(chunk.wavBytes.byteLength);
+      wavCopy.set(chunk.wavBytes);
+
+      const result = await runSingleFetch<{ segments: TranscriptSegment[] }>(
+        '/api/transcribe-chunk',
+        {
+          method: 'POST',
+          headers,
+          body: new Blob([wavCopy.buffer], { type: 'audio/wav' }),
+        },
+        `Parça ${chunk.chunkIndex}/${chunk.totalChunks}`,
+        callbacks.signal
       );
+
+      if (result.ok) {
+        callbacks.onRetryWait?.(null);
+        chunkData = result.data;
+        break;
+      }
+
+      if (!result.retryable) {
+        callbacks.onRetryWait?.(null);
+        throw new Error(result.errorMessage);
+      }
+
+      if (attempt < DEEPGRAM_FALLBACK_RETRY_DELAYS_SEC.length) {
+        const waitSec = result.retryAfterSec ?? DEEPGRAM_FALLBACK_RETRY_DELAYS_SEC[attempt];
+        attempt += 1;
+        await countdownRetryWait(
+          waitSec,
+          `Deepgram (${deepgramModel}) ${result.reason} — Parça ${chunk.chunkIndex}/${chunk.totalChunks} yeniden denenecek (${attempt}/${DEEPGRAM_FALLBACK_RETRY_DELAYS_SEC.length})`,
+          {
+            signal: callbacks.signal,
+            onRetryWait: callbacks.onRetryWait,
+          }
+        );
+        continue;
+      }
+
+      callbacks.onRetryWait?.(null);
+      throw new Error(
+        `${result.errorMessage} (Tamamlanan önceki parçalar önbellekte korundu; kısa bir süre sonra tekrar başlatırsanız Parça ${chunk.chunkIndex}/${chunk.totalChunks}'ten devam edecektir.)`
+      );
+    }
+
+    // Backend already applies chunkOffsetSec to startSec & endSec; do not double-offset.
+    const normalizedChunkSegments: TranscriptSegment[] = [];
+    const chunkSegments = Array.isArray(chunkData?.segments) ? chunkData.segments : [];
+    for (const seg of chunkSegments) {
+      const startSec = round2(Math.max(0, Number(seg.startSec) || 0));
+      const endSec = round2(Math.max(startSec + 0.05, Number(seg.endSec) || 0));
       const text = String(seg.text || '').trim();
-      if (text) {
-        allSegments.push({ startSec, endSec, text });
+      if (text && endSec > startSec) {
+        normalizedChunkSegments.push({ startSec, endSec, text });
       }
     }
 
-    // Wait 2 seconds between consecutive chunks to stay comfortably within Free Tier RPM limits
+    fileCache.set(chunk.chunkIndex, normalizedChunkSegments);
+
+    // Polite 1s delay between consecutive chunks
     if (i < chunks.length - 1) {
-      await sleepWithAbort(INTER_CHUNK_DELAY_MS, callbacks.signal);
+      await sleepWithAbort(DEEPGRAM_INTER_CHUNK_DELAY_MS, callbacks.signal);
     }
+  }
+
+  const allSegments: TranscriptSegment[] = [];
+  for (let idx = 1; idx <= chunks.length; idx++) {
+    const segs = fileCache.get(idx);
+    if (segs) allSegments.push(...segs);
   }
 
   return allSegments.sort((a, b) => a.startSec - b.startSec);
 }
 
+function buildAlignmentModelChain(preferredModel?: string): string[] {
+  const primary = preferredModel?.trim() || 'gemini-4-hydrogen';
+  const order = [primary, 'gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+  return Array.from(new Set(order));
+}
+
 /**
  * Aligns sequentially numbered images against the full timestamped Turkish transcript.
- * Strictly preserves image numeric order and enforces zero gaps / zero overlaps.
+ * Prioritizes gemini-4-hydrogen (Free Tier) for higher semantic accuracy and returns which model ran.
  */
 export async function alignImagesWithTranscript(
   transcriptSegments: TranscriptSegment[],
-  images: UploadedImage[],
+  images: Array<Pick<UploadedImage, 'id' | 'orderNumber' | 'filename' | 'cleanTitle' | 'objectUrl'>>,
   totalAudioDuration: number,
   zoomSpeedPerSec: number,
   settings: EditorSettings,
   callbacks?: ApiCallOptions
-): Promise<TimelineScene[]> {
-  const payload = {
-    transcriptSegments,
-    images: images.map((img) => ({
-      orderNumber: img.orderNumber,
-      filename: img.filename,
-      cleanTitle: img.cleanTitle,
-    })),
-    totalAudioDuration,
-    model: settings.model.trim() || 'gemini-3.8-flash',
-  };
+): Promise<{ scenes: TimelineScene[]; modelUsed: string }> {
+  const modelChain = buildAlignmentModelChain(settings.alignmentModel);
 
-  const data = await postJsonWith429Retry<{
+  const { data, usedModelIndex } = await sendWithModelFailover<{
     alignments: Array<{ index?: number; startSec?: number; matchedExcerpt?: string }>;
-  }>('/api/align-images', payload, settings, callbacks);
+    modelUsed?: string;
+  }>(
+    '/api/align-images',
+    modelChain,
+    0,
+    (modelName) => {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (settings.customApiKey.trim()) {
+        headers['x-gemini-api-key'] = settings.customApiKey.trim();
+      }
+      return {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          transcriptSegments,
+          images: images.map((img) => ({
+            orderNumber: img.orderNumber,
+            filename: img.filename,
+            cleanTitle: img.cleanTitle,
+          })),
+          totalAudioDuration,
+          model: modelName,
+        }),
+      };
+    },
+    'Görsel eşleştirme',
+    callbacks
+  );
 
-  return buildValidatedTimeline(
+  const scenes = buildValidatedTimeline(
     images,
     Array.isArray(data.alignments) ? data.alignments : [],
     totalAudioDuration,
     zoomSpeedPerSec,
     transcriptSegments
   );
+
+  return {
+    scenes,
+    modelUsed: data.modelUsed || modelChain[usedModelIndex] || 'gemini-4-hydrogen',
+  };
 }

@@ -88,6 +88,32 @@ export function readAudioDuration(file: File): Promise<{ durationSec: number; ob
     const audio = new Audio();
     audio.preload = 'metadata';
 
+    const fallbackDecodeDuration = async () => {
+      try {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const ctx = new AudioCtx();
+        try {
+          const buf = await file.arrayBuffer();
+          const decoded = await ctx.decodeAudioData(buf.slice(0));
+          if (Number.isFinite(decoded.duration) && decoded.duration > 0) {
+            resolve({
+              durationSec: Number(decoded.duration.toFixed(2)),
+              objectUrl,
+            });
+            return;
+          }
+        } finally {
+          await ctx.close().catch(() => undefined);
+        }
+      } catch {
+        // fall through to reject
+      }
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Ses dosyasının süresi okunamadı. Geçerli bir MP3, WAV veya M4A dosyası seçin.'));
+    };
+
     const cleanup = () => {
       audio.onloadedmetadata = null;
       audio.onerror = null;
@@ -96,8 +122,7 @@ export function readAudioDuration(file: File): Promise<{ durationSec: number; ob
     audio.onloadedmetadata = () => {
       cleanup();
       if (!Number.isFinite(audio.duration) || audio.duration <= 0) {
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error('Ses dosyasının süresi okunamadı. Geçerli bir MP3, WAV veya M4A dosyası seçin.'));
+        void fallbackDecodeDuration();
         return;
       }
       resolve({
@@ -108,8 +133,7 @@ export function readAudioDuration(file: File): Promise<{ durationSec: number; ob
 
     audio.onerror = () => {
       cleanup();
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error('Ses dosyası tarayıcı tarafından okunamadı.'));
+      void fallbackDecodeDuration();
     };
 
     audio.src = objectUrl;
@@ -121,19 +145,10 @@ export interface SlicedAudioChunk {
   totalChunks: number;
   offsetSec: number;
   durationSec: number;
-  wavBase64: string;
+  wavBytes: Uint8Array;
 }
 
-function uint8ToBase64(bytes: Uint8Array): string {
-  const CHUNK_SIZE = 0x8000;
-  const parts: string[] = [];
-  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-    parts.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK_SIZE)));
-  }
-  return btoa(parts.join(''));
-}
-
-function encodeMono16kWavBase64(samplesFloat: Float32Array, sampleRate = 16000): string {
+function encodeMonoWavBytes(samplesFloat: Float32Array, sampleRate = 16000): Uint8Array {
   const numSamples = samplesFloat.length;
   const dataSize = numSamples * 2;
   const buffer = new ArrayBuffer(44 + dataSize);
@@ -167,20 +182,23 @@ function encodeMono16kWavBase64(samplesFloat: Float32Array, sampleRate = 16000):
     offset += 2;
   }
 
-  return uint8ToBase64(new Uint8Array(buffer));
+  return new Uint8Array(buffer);
 }
 
 /**
- * Decodes the documentary audio via Web Audio API and slices it into lightweight
- * 5-minute (300s) 16kHz mono 16-bit WAV chunks for drift-free cloud & local transcription.
- * Never alters the user's original audio file.
+ * Decodes the documentary audio via Web Audio API and slices it into
+ * 5-minute (300s) 16kHz mono 16-bit binary WAV chunks (~9.6 MB each) for fast,
+ * drift-free speech transcription. Never alters the user's original audio file.
  */
-export async function sliceAudioInto5MinWavChunks(
+export async function sliceAudioIntoWavChunks(
   file: File,
   chunkSeconds = 300,
   onDecodeProgress?: (message: string) => void
 ): Promise<SlicedAudioChunk[]> {
+  const yieldTick = () => new Promise<void>((r) => window.setTimeout(r, 0));
+
   onDecodeProgress?.('Ses dosyası belleğe çözülüyor...');
+  await yieldTick();
   const arrayBuffer = await file.arrayBuffer();
 
   const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -201,6 +219,7 @@ export async function sliceAudioInto5MinWavChunks(
     channelData.push(decoded.getChannelData(ch));
   }
 
+  // 16kHz mono 16-bit PCM = ~9.6 MB per 5-minute chunk (ideal speech clarity for Deepgram)
   const targetRate = 16000;
   const totalChunks = Math.max(1, Math.ceil(totalDuration / chunkSeconds));
   const chunks: SlicedAudioChunk[] = [];
@@ -211,8 +230,9 @@ export async function sliceAudioInto5MinWavChunks(
     const durationSec = Math.max(0.1, endSec - offsetSec);
 
     onDecodeProgress?.(
-      `5 dakikalık hafif WAV parçaları hazırlanıyor (${idx + 1}/${totalChunks})...`
+      `5 dakikalık 16kHz WAV parçaları hazırlanıyor (${idx + 1}/${totalChunks})...`
     );
+    await yieldTick();
 
     const startSample = Math.floor(offsetSec * srcRate);
     const endSample = Math.min(decoded.length, Math.floor(endSec * srcRate));
@@ -240,7 +260,7 @@ export async function sliceAudioInto5MinWavChunks(
       totalChunks,
       offsetSec: Number(offsetSec.toFixed(2)),
       durationSec: Number(durationSec.toFixed(2)),
-      wavBase64: encodeMono16kWavBase64(outSamples, targetRate),
+      wavBytes: encodeMonoWavBytes(outSamples, targetRate),
     });
   }
 

@@ -1,6 +1,7 @@
 import JSZip from 'jszip';
-import { FIXED_DISSOLVE_SEC, TimelineScene } from '../types/editor';
+import { FIXED_DISSOLVE_SEC, TimelineScene, TranscriptSegment } from '../types/editor';
 import { formatMMSS, formatZoomSpeedPct } from './timelineMath';
+import { segmentsToSrt } from './mediaUtils';
 
 export interface ExportTimelinePayload {
   audioFile: string;
@@ -9,6 +10,8 @@ export interface ExportTimelinePayload {
   dissolveDurationSec: number;
   resolution: '1920x1080';
   fps: 30;
+  burnSubtitles: boolean;
+  subtitleFile: string | null;
   scenes: Array<{
     orderNumber: number;
     filename: string;
@@ -28,7 +31,8 @@ export function buildTimelineJson(
   audioFileName: string,
   totalAudioDuration: number,
   zoomSpeedPerSec: number,
-  scenes: TimelineScene[]
+  scenes: TimelineScene[],
+  burnSubtitles = false
 ): ExportTimelinePayload {
   return {
     audioFile: audioFileName,
@@ -37,6 +41,8 @@ export function buildTimelineJson(
     dissolveDurationSec: FIXED_DISSOLVE_SEC,
     resolution: '1920x1080',
     fps: 30,
+    burnSubtitles,
+    subtitleFile: burnSubtitles ? 'subtitles.srt' : null,
     scenes: scenes.map((sc) => ({
       orderNumber: sc.orderNumber,
       filename: sc.filename,
@@ -64,13 +70,14 @@ Ozellikler:
   boylece 1 saniyelik dissolve gecisinde dahi zoom hizi birebir sabit kalir).
 - 2x (3840x2160) on-olcekleme ile titresimsiz, jilet gibi yumusak 1920x1080 @ 30fps cikti.
 - 10'ar kliplik bellek-dostu toplu (batched) xfade birlestirme (sifir senkron kaymasi).
+- Istege bagli Turkce UTF-8 altyazi gomme (timeline.json icinde burnSubtitles=true ise
+  subtitles.srt dosyasi sinematik okunakli stille videoya eklenir).
 - Orijinal ses dosyasi ASLA yeniden kodlanmaz (-c:a copy).
   * .mp3 / .m4a / .aac -> belgesel_1080p.mp4 (+faststart)
   * .wav / .flac / .aiff -> belgesel_1080p.mov (kayipsiz PCM, Filmora ile tam uyumlu)
 """
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -99,8 +106,14 @@ def check_ffmpeg() -> str:
     return ffmpeg_bin
 
 
-def run_cmd(cmd: list[str], label: str) -> None:
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def run_cmd(cmd: list[str], label: str, cwd: Path | None = None) -> None:
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(cwd) if cwd else None,
+    )
     if proc.returncode != 0:
         print(f"\\nHATA ({label}): FFmpeg cikis kodu {proc.returncode}")
         tail = "\\n".join(proc.stderr.strip().splitlines()[-20:])
@@ -118,8 +131,6 @@ def render_single_clip(
     fps: int,
 ) -> None:
     frames = max(2, int(round(render_duration_sec * fps)))
-    # 2x (3840x2160) cover-crop -> floating-point linear centered zoompan -> 1920x1080 @ 30fps
-    # Exact linear interpolation: scale(on) = start_scale + (end_scale - start_scale) * min(on/(frames-1), 1)
     zoom_expr = f"{start_scale:.6f}+({end_scale - start_scale:.6f})*min(on/{frames - 1},1)"
     vf = (
         "scale=3840:2160:force_original_aspect_ratio=increase,"
@@ -169,11 +180,6 @@ def xfade_group(
     fps: int,
     label: str,
 ) -> None:
-    """
-    Stitches 2..10 video clips with 1.0s fade transitions at exact cumulative timeline offsets.
-    Because each non-final input clip already carries +1.0s of tail (L_i = D_i + 1.0),
-    cumulative offsets D_0, D_0 + D_1, ... produce exact zero-drift duration.
-    """
     if len(input_paths) == 1:
         shutil.copy2(input_paths[0], out_path)
         return
@@ -229,9 +235,6 @@ def hierarchical_xfade(
     tmp_dir: Path,
     fps: int,
 ) -> Path:
-    """
-    Memory-safe hierarchical xfade in batches of 10 clips so RAM stays low even with 100+ images.
-    """
     current_paths = clip_paths
     current_durs = clip_timeline_durations
     level = 1
@@ -271,6 +274,53 @@ def hierarchical_xfade(
     return current_paths[0]
 
 
+def burn_subtitles_onto_video(
+    ffmpeg_bin: str,
+    input_video: Path,
+    subtitle_filename: str,
+    out_video: Path,
+    base_dir: Path,
+    fps: int,
+) -> None:
+    """
+    Burns UTF-8 Turkish SRT subtitles with crisp documentary styling.
+    Runs with cwd=base_dir and relative subtitle filename so Windows drive letters
+    (e.g. C:\\...) never break FFmpeg's subtitles filter escaping.
+    """
+    style = (
+        "FontName=Arial,FontSize=20,"
+        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        "BackColour=&H96000000,BorderStyle=3,Outline=1,Shadow=0,"
+        "Alignment=2,MarginL=80,MarginR=80,MarginV=36"
+    )
+    vf = f"subtitles='{subtitle_filename}':charenc=UTF-8:force_style='{style}'"
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_video),
+        "-vf",
+        vf,
+        "-r",
+        str(fps),
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        str(out_video),
+    ]
+    run_cmd(cmd, "Altyazi gomme (subtitles.srt)", cwd=base_dir)
+
+
 def main() -> None:
     base_dir = Path(__file__).resolve().parent
     timeline_path = base_dir / "timeline.json"
@@ -284,27 +334,32 @@ def main() -> None:
     with timeline_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    audio_name = data["audioFile"]
-    audio_path = base_dir / audio_name
+    audio_name = (data.get("audioFile") or "").strip()
+    audio_path = (base_dir / audio_name) if audio_name else None
     scenes = data["scenes"]
     fps = int(data.get("fps", 30))
     dissolve_sec = float(data.get("dissolveDurationSec", 1.0))
     zoom_speed = float(data.get("zoomSpeedPerSec", 0.0025))
+    burn_subtitles = bool(data.get("burnSubtitles", False))
+    subtitle_name = data.get("subtitleFile") or "subtitles.srt"
+    subtitle_path = base_dir / subtitle_name
 
     if not scenes:
         print("HATA: timeline.json icinde hic sahne yok.")
         sys.exit(1)
 
     missing = []
-    if not audio_path.exists():
+    if audio_path is not None and not audio_path.exists():
         missing.append(f"Ses dosyasi: {audio_name}")
+    if burn_subtitles and not subtitle_path.exists():
+        missing.append(f"Altyazi dosyasi: {subtitle_name}")
     for sc in scenes:
         img_p = base_dir / sc["filename"]
         if not img_p.exists():
             missing.append(f"Gorsel: {sc['filename']}")
 
     if missing:
-        print("HATA: Asagidaki medya dosyalari render.py ile ayni klasorde bulunamadi:")
+        print("HATA: Asagidaki dosyalar render.py ile ayni klasorde bulunamadi:")
         for item in missing[:15]:
             print(f"  - {item}")
         if len(missing) > 15:
@@ -315,10 +370,14 @@ def main() -> None:
     total_dur = float(data.get("totalAudioDuration", sum(s["durationSec"] for s in scenes)))
     print("=" * 64)
     print("Belgesel Kurgu Asistani — 16:9 1080p Render Baslatiliyor")
-    print(f"Ses Dosyasi : {audio_name} ({fmt_time(total_dur)}) [Dokunulmadan -c:a copy]")
+    if audio_name:
+        print(f"Ses Dosyasi : {audio_name} ({fmt_time(total_dur)}) [Dokunulmadan -c:a copy]")
+    else:
+        print(f"Ses Dosyasi : Yok (Yalnizca 16:9 1080p goruntu · {fmt_time(total_dur)})")
     print(f"Gorsel Sayisi: {total_scenes} adet")
     print(f"Zoom Hizi   : %{zoom_speed * 100:.2f}/sn (Sabit Hiz, L_i = D_i + {dissolve_sec:.1f}s)")
     print(f"Cozunurluk  : 1920x1080 @ {fps}fps | Dissolve: {dissolve_sec:.1f} sn")
+    print(f"Altyazi     : {'ACIK (' + subtitle_name + ')' if burn_subtitles else 'KAPALI'}")
     print("=" * 64)
 
     tmp_dir = base_dir / "_belgesel_render_tmp"
@@ -329,14 +388,12 @@ def main() -> None:
     started_at = time.time()
 
     try:
-        # 1. Render each still image into a silky-smooth constant-speed Ken Burns clip
         clip_paths: list[Path] = []
         clip_timeline_durs: list[float] = []
 
         for idx, sc in enumerate(scenes):
             is_last = idx == total_scenes - 1
             d_i = float(sc["durationSec"])
-            # Exact render duration L_i: non-final clips get +dissolve_sec tail so zoom stays constant during dissolve
             l_i = d_i if is_last else d_i + dissolve_sec
             zoom_delta = l_i * zoom_speed
             max_scale = min(1.0 + zoom_delta, 2.0)
@@ -375,7 +432,6 @@ def main() -> None:
             clip_paths.append(clip_out)
             clip_timeline_durs.append(d_i)
 
-        # 2. Stitch clips in memory-safe batches of 10 with exact 1.0s dissolve
         print("\\nGorsel klipleri 1.0 saniyelik dissolve ile birlestiriliyor...")
         merged_video = hierarchical_xfade(
             ffmpeg_bin=ffmpeg_bin,
@@ -386,9 +442,39 @@ def main() -> None:
             fps=fps,
         )
 
-        # 3. Mux untouched original audio (-c:a copy)
-        audio_ext = audio_path.suffix.lower()
-        if audio_ext in LOSSLESS_AUDIO_EXTS:
+        video_for_mux = merged_video
+        if burn_subtitles:
+            print(f"\\nAltyazilar ({subtitle_name}) videoya isleniyor...")
+            subtitled_video = tmp_dir / "merged_subtitled.mp4"
+            burn_subtitles_onto_video(
+                ffmpeg_bin=ffmpeg_bin,
+                input_video=merged_video,
+                subtitle_filename=subtitle_name,
+                out_video=subtitled_video,
+                base_dir=base_dir,
+                fps=fps,
+            )
+            video_for_mux = subtitled_video
+
+        if audio_path is None:
+            final_output = base_dir / "belgesel_1080p.mp4"
+            print("\\nSes dosyasi belirtilmedigi icin yalnizca 16:9 1080p goruntu kaydediliyor...")
+            mux_cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(video_for_mux),
+                "-c:v",
+                "copy",
+                "-an",
+                "-movflags",
+                "+faststart",
+                str(final_output),
+            ]
+        elif audio_path.suffix.lower() in LOSSLESS_AUDIO_EXTS:
             final_output = base_dir / "belgesel_1080p.mov"
             print(
                 "\\nBilgi: Ses dosyaniz kayipsiz PCM (.wav/.flac/.aiff) formatinda oldugu icin "
@@ -401,7 +487,7 @@ def main() -> None:
                 "-loglevel",
                 "error",
                 "-i",
-                str(merged_video),
+                str(video_for_mux),
                 "-i",
                 str(audio_path),
                 "-map",
@@ -424,7 +510,7 @@ def main() -> None:
                 "-loglevel",
                 "error",
                 "-i",
-                str(merged_video),
+                str(video_for_mux),
                 "-i",
                 str(audio_path),
                 "-map",
@@ -463,25 +549,29 @@ export function generateExportReadme(
   audioFileName: string,
   totalAudioDuration: number,
   sceneCount: number,
-  zoomSpeedPerSec: number
+  zoomSpeedPerSec: number,
+  burnSubtitles = false
 ): string {
-  const isWav = /\.(wav|aif|aiff|flac)$/i.test(audioFileName);
+  const cleanAudio = audioFileName.trim();
+  const isWav = Boolean(cleanAudio) && /\.(wav|aif|aiff|flac)$/i.test(cleanAudio);
   const outName = isWav ? 'belgesel_1080p.mov' : 'belgesel_1080p.mp4';
+  const fileCount = burnSubtitles ? 4 : 3;
 
   return `# Belgesel Kurgu Asistanı — Render Paketi
 
-Bu paket, **Belgesel Kurgu Asistanı** ile hazırladığınız zaman çizelgesini bilgisayarınızda yüksek kalitede (**1920×1080 @ 30fps**, sabit hızlı Ken Burns + **1.0 sn Dissolve**, orijinal ses dokunulmadan \`-c:a copy\`) videoya dönüştürmek için gereken 3 hafif dosyayı içerir.
+Bu paket, **Belgesel Kurgu Asistanı** ile hazırladığınız zaman çizelgesini bilgisayarınızda yüksek kalitede (**1920×1080 @ 30fps**, sabit hızlı Ken Burns + **1.0 sn Dissolve**${cleanAudio ? ', orijinal ses dokunulmadan `-c:a copy`' : ''}) videoya dönüştürmek için gereken ${fileCount} hafif dosyayı içerir.
 
 ## Proje Özeti
-- **Ses Dosyası:** \`${audioFileName}\` (${formatMMSS(totalAudioDuration)})
+- **Ses Dosyası:** ${cleanAudio ? `\`${cleanAudio}\` (${formatMMSS(totalAudioDuration)})` : `Belirtilmedi (Yalnızca 16:9 1080p görüntü · ${formatMMSS(totalAudioDuration)})`}
 - **Görsel Sayısı:** ${sceneCount} adet
 - **Genel Zoom Hızı:** ${formatZoomSpeedPct(zoomSpeedPerSec)} (tüm kliplerde ve 1 sn dissolve boyunca sabit hız)
-- **Çıktı Dosyası:** \`${outName}\`${isWav ? ' *(Kayipsiz WAV sesi yeniden kodlamadan korumak için Filmora uyumlu MOV)*' : ''}
+- **Videoya Gömülü Altyazı:** ${burnSubtitles ? 'Açık (`subtitles.srt` dosyası UTF-8 Türkçe olarak videoya işlenir)' : 'Kapalı'}
+- **Çıktı Dosyası:** \`${outName}\`${isWav ? ' *(Kayıpsız WAV sesi yeniden kodlamadan korumak için Filmora uyumlu MOV)*' : ''}
 
 ## 3 Adımda Video Oluşturma
 
 1. **Dosyaları Medya Klasörüne Koyun:**
-   Bu ZIP içindeki \`timeline.json\` ve \`render.py\` dosyalarını, orijinal ses dosyanızın (\`${audioFileName}\`) ve tüm sıralı görsellerinizin bulunduğu **aynı klasörün içine** kopyalayın.
+   Bu ZIP içindeki \`timeline.json\`, \`render.py\`${burnSubtitles ? ' ve `subtitles.srt`' : ''} dosyalarını, ${cleanAudio ? `orijinal ses dosyanızın (\`${cleanAudio}\`) ve ` : ''}tüm sıralı görsellerinizin bulunduğu **aynı klasörün içine** kopyalayın.
 
 2. **FFmpeg ve Python 3'ün Kurulu Olduğundan Emin Olun:**
    - **Windows:** PowerShell'de \`winget install Gyan.FFmpeg\` (Python yoksa \`winget install Python.Python.3.12\`)
@@ -496,6 +586,9 @@ Bu paket, **Belgesel Kurgu Asistanı** ile hazırladığınız zaman çizelgesin
 
 ## Wondershare Filmora'ya Aktarma
 İşlem bittiğinde klasörde oluşan **\`${outName}\`** dosyasını doğrudan Wondershare Filmora'ya sürükleyip bırakın. Görüntü 16:9 1080p, geçişler pürüzsüz ve orijinal belgesel sesiniz tek bir bit bile değişmeden hazır olacaktır.
+
+## Otomatik Transkript Notu (Deepgram)
+Uygulama içinde ses dosyalarını otomatik olarak Türkçe metne çevirmek için **Deepgram** (\`nova-3\` / \`nova-2\`) kullanılır. [console.deepgram.com](https://console.deepgram.com) adresinden kredi kartı gerekmeden ücretsiz $200 başlangıç kredili API anahtarı alıp uygulamadaki **Ayarlar** penceresine ekleyebilir veya dilerseniz Adım 1'de hazır \`.srt\` dosyanızı doğrudan yükleyebilirsiniz.
 `;
 }
 
@@ -503,22 +596,35 @@ export async function downloadKurguPaketiZip(
   audioFileName: string,
   totalAudioDuration: number,
   zoomSpeedPerSec: number,
-  scenes: TimelineScene[]
+  scenes: TimelineScene[],
+  burnSubtitles = false,
+  transcriptSegments: TranscriptSegment[] = []
 ): Promise<void> {
   const zip = new JSZip();
+  const includeSubs = burnSubtitles && transcriptSegments.length > 0;
 
   const timelinePayload = buildTimelineJson(
     audioFileName,
     totalAudioDuration,
     zoomSpeedPerSec,
-    scenes
+    scenes,
+    includeSubs
   );
 
   zip.file('timeline.json', JSON.stringify(timelinePayload, null, 2));
   zip.file('render.py', generateRenderPy());
+  if (includeSubs) {
+    zip.file('subtitles.srt', segmentsToSrt(transcriptSegments));
+  }
   zip.file(
     'README.md',
-    generateExportReadme(audioFileName, totalAudioDuration, scenes.length, zoomSpeedPerSec)
+    generateExportReadme(
+      audioFileName,
+      totalAudioDuration,
+      scenes.length,
+      zoomSpeedPerSec,
+      includeSubs
+    )
   );
 
   const blob = await zip.generateAsync({ type: 'blob' });

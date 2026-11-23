@@ -8,12 +8,216 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 
+const DEEPGRAM_LISTEN_BASE_URL = 'https://api.deepgram.com/v1/listen';
+const ALLOWED_DEEPGRAM_MODELS = new Set(['nova-3', 'nova-2']);
+
 function resolveGeminiKey(req: Request): string {
   const headerKey = req.header('x-gemini-api-key')?.trim();
   if (headerKey) return headerKey;
   const envKey = process.env.GEMINI_API_KEY?.trim();
   if (envKey && envKey !== 'MY_GEMINI_API_KEY') return envKey;
   return '';
+}
+
+function resolveDeepgramKey(req: Request, bodyKey?: string): string {
+  const headerKey = req.header('x-deepgram-api-key')?.trim();
+  if (headerKey) return headerKey;
+  const directKey = typeof bodyKey === 'string' ? bodyKey.trim() : '';
+  if (directKey) return directKey;
+  const envKey = process.env.DEEPGRAM_API_KEY?.trim();
+  if (envKey && envKey !== 'MY_DEEPGRAM_API_KEY') return envKey;
+  return '';
+}
+
+function parseRetryAfterSec(rawHeader: string | null): number {
+  if (!rawHeader) return 10;
+  const trimmed = rawHeader.trim();
+  const numeric = Number(trimmed);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return Math.min(120, Math.max(1, Math.ceil(numeric)));
+  }
+  const dateMs = Date.parse(trimmed);
+  if (Number.isFinite(dateMs)) {
+    const diffSec = Math.ceil((dateMs - Date.now()) / 1000);
+    if (diffSec > 0) return Math.min(120, diffSec);
+  }
+  return 10;
+}
+
+interface DeepgramWord {
+  word?: string;
+  punctuated_word?: string;
+  start?: number;
+  end?: number;
+}
+
+interface DeepgramUtterance {
+  start?: number;
+  end?: number;
+  transcript?: string;
+  words?: DeepgramWord[];
+}
+
+interface DeepgramSentence {
+  start?: number;
+  end?: number;
+  text?: string;
+}
+
+interface DeepgramParagraph {
+  sentences?: DeepgramSentence[];
+}
+
+interface DeepgramListenResponse {
+  results?: {
+    utterances?: DeepgramUtterance[];
+    channels?: Array<{
+      alternatives?: Array<{
+        transcript?: string;
+        words?: DeepgramWord[];
+        paragraphs?: {
+          paragraphs?: DeepgramParagraph[];
+        };
+      }>;
+    }>;
+  };
+}
+
+interface RawRelativeSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+const SENTENCE_END_RE = /[.!?…]["'”’)\]]*$/;
+const CLAUSE_BREAK_RE = /[,;:]["'”’)\]]*$/;
+
+/**
+ * Splits a Deepgram utterance cleanly at sentence boundaries (. ? !) using word-level
+ * timestamps so long continuous documentary narration stays crisp and readable for subtitles.
+ */
+function splitUtteranceBySentences(utt: DeepgramUtterance): RawRelativeSegment[] {
+  const words = Array.isArray(utt.words) ? utt.words : [];
+  if (words.length === 0) {
+    const text = typeof utt.transcript === 'string' ? utt.transcript.trim() : '';
+    const start = Number(utt.start);
+    const end = Number(utt.end);
+    if (text && Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      return [{ start, end, text }];
+    }
+    return [];
+  }
+
+  const out: RawRelativeSegment[] = [];
+  let tokens: string[] = [];
+  let segStart = -1;
+  let segEnd = -1;
+
+  const flush = () => {
+    const text = tokens.join(' ').replace(/\s+/g, ' ').trim();
+    if (text && Number.isFinite(segStart) && Number.isFinite(segEnd) && segEnd > segStart) {
+      out.push({ start: segStart, end: segEnd, text });
+    }
+    tokens = [];
+    segStart = -1;
+    segEnd = -1;
+  };
+
+  for (const w of words) {
+    const token = String(w.punctuated_word || w.word || '').trim();
+    if (!token) continue;
+    const wStart = Number(w.start);
+    const wEnd = Number(w.end);
+    if (!Number.isFinite(wStart) || !Number.isFinite(wEnd)) continue;
+
+    if (segStart < 0) segStart = wStart;
+    segEnd = Math.max(segEnd, wEnd);
+    tokens.push(token);
+
+    if (SENTENCE_END_RE.test(token)) {
+      flush();
+    } else if (tokens.length >= 22 && CLAUSE_BREAK_RE.test(token)) {
+      flush();
+    }
+  }
+  flush();
+
+  return out;
+}
+
+/**
+ * 3-tier Deepgram segment extraction:
+ * 1. results.utterances (split cleanly at sentence boundaries for subtitles)
+ * 2. Fallback: results.channels[0].alternatives[0].paragraphs.paragraphs[].sentences[]
+ * 3. Fallback: group words[] into ~12-word timestamped segments
+ */
+function extractDeepgramRelativeSegments(data: DeepgramListenResponse): RawRelativeSegment[] {
+  const rawSegments: RawRelativeSegment[] = [];
+
+  // Tier 1: Utterances (with sentence-boundary splitting)
+  const utterances = data.results?.utterances;
+  if (Array.isArray(utterances) && utterances.length > 0) {
+    for (const utt of utterances) {
+      rawSegments.push(...splitUtteranceBySentences(utt));
+    }
+  }
+  if (rawSegments.length > 0) return rawSegments;
+
+  const firstAlt = data.results?.channels?.[0]?.alternatives?.[0];
+
+  // Tier 2: Paragraphs -> Sentences
+  const paragraphs = firstAlt?.paragraphs?.paragraphs;
+  if (Array.isArray(paragraphs) && paragraphs.length > 0) {
+    for (const para of paragraphs) {
+      const sentences = Array.isArray(para.sentences) ? para.sentences : [];
+      for (const s of sentences) {
+        const text = typeof s.text === 'string' ? s.text.trim() : '';
+        const start = Number(s.start);
+        const end = Number(s.end);
+        if (text && Number.isFinite(start) && Number.isFinite(end) && end > start) {
+          rawSegments.push({ start, end, text });
+        }
+      }
+    }
+  }
+  if (rawSegments.length > 0) return rawSegments;
+
+  // Tier 3: Group words[] into ~12-word segments
+  const words = firstAlt?.words;
+  if (Array.isArray(words) && words.length > 0) {
+    let tokens: string[] = [];
+    let segStart = -1;
+    let segEnd = -1;
+
+    const flush = () => {
+      const text = tokens.join(' ').replace(/\s+/g, ' ').trim();
+      if (text && Number.isFinite(segStart) && Number.isFinite(segEnd) && segEnd > segStart) {
+        rawSegments.push({ start: segStart, end: segEnd, text });
+      }
+      tokens = [];
+      segStart = -1;
+      segEnd = -1;
+    };
+
+    for (const w of words) {
+      const token = String(w.punctuated_word || w.word || '').trim();
+      if (!token) continue;
+      const wStart = Number(w.start);
+      const wEnd = Number(w.end);
+      if (!Number.isFinite(wStart) || !Number.isFinite(wEnd)) continue;
+
+      if (segStart < 0) segStart = wStart;
+      segEnd = Math.max(segEnd, wEnd);
+      tokens.push(token);
+
+      if ((tokens.length >= 8 && SENTENCE_END_RE.test(token)) || tokens.length >= 12) {
+        flush();
+      }
+    }
+    flush();
+  }
+
+  return rawSegments;
 }
 
 function createGenAIClient(apiKey: string): GoogleGenAI {
@@ -27,7 +231,38 @@ function createGenAIClient(apiKey: string): GoogleGenAI {
   });
 }
 
-function parseErrorStatus(err: unknown): { status: number; message: string; code?: string } {
+function extractInnerMessage(raw: string): { message: string; code?: number; status?: string } {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        error?: { code?: number; status?: string; message?: string };
+        message?: string;
+      };
+      if (parsed?.error?.message) {
+        return {
+          message: parsed.error.message,
+          code: parsed.error.code,
+          status: parsed.error.status,
+        };
+      }
+      if (parsed?.message) {
+        return { message: parsed.message };
+      }
+    } catch {
+      // not JSON
+    }
+  }
+  return { message: raw };
+}
+
+function parseErrorStatus(err: unknown): {
+  httpStatus: number;
+  upstreamStatus: number;
+  message: string;
+  code?: string;
+  retryable: boolean;
+} {
   const anyErr = err as {
     status?: number;
     statusCode?: number;
@@ -35,56 +270,81 @@ function parseErrorStatus(err: unknown): { status: number; message: string; code
     error?: { code?: number; status?: string; message?: string };
   };
 
-  const rawMsg =
+  const rawTop =
     anyErr?.error?.message ||
     anyErr?.message ||
     'Gemini API isteği sırasında beklenmeyen bir hata oluştu.';
+  const inner = extractInnerMessage(rawTop);
+  const cleanMsg = inner.message;
 
-  let status =
+  let upstreamStatus =
     typeof anyErr?.status === 'number'
       ? anyErr.status
       : typeof anyErr?.statusCode === 'number'
         ? anyErr.statusCode
         : typeof anyErr?.error?.code === 'number'
           ? anyErr.error.code
-          : 500;
+          : typeof inner.code === 'number'
+            ? inner.code
+            : 500;
 
-  if (status === 500) {
-    if (/429|RESOURCE_EXHAUSTED|quota|rate limit/i.test(rawMsg)) status = 429;
-    else if (/404|NOT_FOUND|not found|not supported/i.test(rawMsg)) status = 404;
-    else if (/403|PERMISSION_DENIED/i.test(rawMsg)) status = 403;
-    else if (/400|INVALID_ARGUMENT|API_KEY_INVALID/i.test(rawMsg)) status = 400;
+  if (upstreamStatus === 500) {
+    if (/429|RESOURCE_EXHAUSTED|quota|rate limit/i.test(cleanMsg)) upstreamStatus = 429;
+    else if (/503|UNAVAILABLE|high demand|overloaded/i.test(cleanMsg)) upstreamStatus = 503;
+    else if (/504|DEADLINE_EXCEEDED|timeout/i.test(cleanMsg)) upstreamStatus = 504;
+    else if (/404|NOT_FOUND|not found|not supported/i.test(cleanMsg)) upstreamStatus = 404;
+    else if (/403|PERMISSION_DENIED/i.test(cleanMsg)) upstreamStatus = 403;
+    else if (/400|INVALID_ARGUMENT|API_KEY_INVALID/i.test(cleanMsg)) upstreamStatus = 400;
   }
 
-  let friendlyTr = rawMsg;
-  if (status === 429) {
-    friendlyTr = `Hız sınırına ulaşıldı (429 RESOURCE_EXHAUSTED). Kısa beklemenin ardından yeniden denenecek.`;
-  } else if (status === 404) {
-    friendlyTr = `Seçili model bu uç noktada bulunamadı (404). Ayarlar'dan model adını kontrol edin (örn. gemini-3.8-flash veya gemini-4-hydrogen). Detay: ${rawMsg}`;
-  } else if (status === 403 || /API_KEY_INVALID/i.test(rawMsg)) {
-    friendlyTr = `Gemini API anahtarı geçersiz veya yetkisiz. Ayarlar'daki anahtarı veya sunucu Secrets yapılandırmasını kontrol edin.`;
+  const code =
+    anyErr?.error?.status ||
+    inner.status ||
+    (upstreamStatus === 429
+      ? 'RESOURCE_EXHAUSTED'
+      : upstreamStatus === 503
+        ? 'UNAVAILABLE'
+        : undefined);
+
+  const retryable =
+    upstreamStatus === 429 ||
+    upstreamStatus === 502 ||
+    upstreamStatus === 503 ||
+    upstreamStatus === 504;
+
+  // CRITICAL: Cloud preview nginx intercepts HTTP 403, 502, 503, 504 and replaces
+  // the JSON body with HTML (/forbidden.html or /warmup.html with HTTP 200!).
+  // Map those upstream statuses to safe JSON HTTP statuses (401 or 429 / 500).
+  let httpStatus = upstreamStatus;
+  if (upstreamStatus === 403) {
+    httpStatus = 401;
+  } else if (upstreamStatus === 502 || upstreamStatus === 503 || upstreamStatus === 504) {
+    httpStatus = 429;
+  }
+
+  let friendlyTr = cleanMsg;
+  if (upstreamStatus === 429) {
+    friendlyTr =
+      'Gemini Free Tier hız sınırına ulaşıldı (429). Kısa beklemenin ardından otomatik yeniden denenecek.';
+  } else if (upstreamStatus === 503 || upstreamStatus === 502 || upstreamStatus === 504) {
+    friendlyTr =
+      `Seçili Gemini modeli şu an geçici olarak yoğun (${upstreamStatus} ${code || 'UNAVAILABLE'}). Kısa beklemenin ardından otomatik yeniden denenecek; sorun sürerse Ayarlar'dan farklı bir model deneyebilirsiniz.`;
+  } else if (upstreamStatus === 404) {
+    friendlyTr = `Seçili model bu uç noktada bulunamadı (404). Ayarlar'dan model adını kontrol edin (örn. gemini-3.8-flash veya gemini-4-hydrogen). Detay: ${cleanMsg}`;
+  } else if (upstreamStatus === 403 || upstreamStatus === 401 || /API_KEY_INVALID/i.test(cleanMsg)) {
+    friendlyTr =
+      'Gemini API anahtarı geçersiz veya yetkisiz. Ayarlar penceresindeki anahtarı veya sunucu yapılandırmasını kontrol edin.';
   }
 
   return {
-    status,
+    httpStatus,
+    upstreamStatus,
     message: friendlyTr,
-    code: anyErr?.error?.status || (status === 429 ? 'RESOURCE_EXHAUSTED' : undefined),
+    code,
+    retryable,
   };
 }
 
-function parseTimestampToSec(raw: unknown): number {
-  if (typeof raw === 'number' && Number.isFinite(raw)) return Math.max(0, raw);
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    const parts = trimmed.split(':').map((p) => Number(p.replace(',', '.')));
-    if (parts.every((n) => Number.isFinite(n))) {
-      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-      if (parts.length === 2) return parts[0] * 60 + parts[1];
-      if (parts.length === 1) return parts[0];
-    }
-  }
-  return 0;
-}
 
 function formatMMSS(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
@@ -99,136 +359,192 @@ function formatMMSS(sec: number): string {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '30mb' }));
+  app.use(express.json({ limit: '32mb' }));
+  app.use(
+    '/api/transcribe-chunk',
+    express.raw({
+      type: ['audio/wav', 'application/octet-stream'],
+      limit: '25mb',
+    })
+  );
 
   app.get('/api/health', (_req: Request, res: Response) => {
     const hasGemini =
       Boolean(process.env.GEMINI_API_KEY?.trim()) &&
       process.env.GEMINI_API_KEY?.trim() !== 'MY_GEMINI_API_KEY';
-    res.json({ ok: true, hasServerGeminiKey: hasGemini });
+    const hasDeepgramKey =
+      Boolean(process.env.DEEPGRAM_API_KEY?.trim()) &&
+      process.env.DEEPGRAM_API_KEY?.trim() !== 'MY_DEEPGRAM_API_KEY';
+    res.json({ ok: true, hasServerGeminiKey: hasGemini, hasDeepgramKey });
   });
 
-  // 1. Transcribe a 5-minute 16kHz mono WAV audio chunk with precise relative timestamps
+  // 1. Transcribe a 5-minute 16kHz mono WAV audio chunk via Deepgram Pre-Recorded Audio API
   app.post('/api/transcribe-chunk', async (req: Request, res: Response) => {
     try {
-      const apiKey = resolveGeminiKey(req);
-      if (!apiKey) {
-        res.status(401).json({
+      let wavBuffer: Buffer | null = null;
+      let chunkOffsetSec = 0;
+      let chunkDurationSec = 300;
+      let requestedModel = 'nova-3';
+      let bodyDeepgramKey: string | undefined;
+
+      if (Buffer.isBuffer(req.body)) {
+        wavBuffer = req.body;
+        const parsedOffset = Number(req.header('x-chunk-offset') ?? req.query.chunkOffsetSec ?? 0);
+        chunkOffsetSec = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+
+        const parsedDur = Number(req.header('x-chunk-duration') ?? req.query.chunkDurationSec ?? 300);
+        chunkDurationSec = Number.isFinite(parsedDur) && parsedDur > 0 ? parsedDur : 300;
+
+        requestedModel = (
+          req.header('x-deepgram-model') ||
+          String(req.query.deepgramModel || '')
+        ).trim();
+      } else {
+        const body = (req.body || {}) as {
+          audioBase64?: string;
+          chunkOffsetSec?: number;
+          chunkDurationSec?: number;
+          deepgramModel?: string;
+          deepgramApiKey?: string;
+        };
+        if (typeof body.audioBase64 === 'string' && body.audioBase64.trim()) {
+          wavBuffer = Buffer.from(body.audioBase64, 'base64');
+        }
+        const parsedOffset = Number(body.chunkOffsetSec ?? 0);
+        chunkOffsetSec = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+
+        const parsedDur = Number(body.chunkDurationSec ?? 300);
+        chunkDurationSec = Number.isFinite(parsedDur) && parsedDur > 0 ? parsedDur : 300;
+
+        requestedModel = typeof body.deepgramModel === 'string' ? body.deepgramModel.trim() : '';
+        bodyDeepgramKey = body.deepgramApiKey;
+      }
+
+      const deepgramApiKey = resolveDeepgramKey(req, bodyDeepgramKey);
+      if (!deepgramApiKey) {
+        res.status(400).json({
           error:
-            'Gemini API anahtarı bulunamadı. Ayarlar penceresinden anahtar girin veya sunucu GEMINI_API_KEY değişkenini tanımlayın.',
+            "Otomatik transkript için Ayarlar'dan Deepgram API anahtarınızı (console.deepgram.com) girin veya Adım 1'de hazır .srt dosyanızı yükleyin.",
         });
         return;
       }
 
-      const {
-        audioBase64,
-        mimeType = 'audio/wav',
-        chunkDurationSec = 300,
-        model = 'gemini-3.8-flash',
-      } = req.body as {
-        audioBase64?: string;
-        mimeType?: string;
-        chunkDurationSec?: number;
-        model?: string;
-      };
-
-      if (!audioBase64 || typeof audioBase64 !== 'string') {
-        res.status(400).json({ error: 'Ses parçası verisi eksik.' });
+      if (!wavBuffer || wavBuffer.length === 0) {
+        res.status(400).json({ error: 'Ses parçası verisi boş veya eksik.' });
         return;
       }
 
-      const ai = createGenAIClient(apiKey);
-      const maxDur = Math.max(1, Number(chunkDurationSec) || 300);
+      const deepgramModel = ALLOWED_DEEPGRAM_MODELS.has(requestedModel)
+        ? requestedModel
+        : 'nova-3';
 
-      const prompt = `Bu Türkçe belgesel ses kaydını tam ve eksiksiz olarak yazıya dök.
-Kurallar:
-- Her konuşma cümlesini veya 5–12 saniyelik doğal cümle öbeğini kesin zaman damgalarıyla (bu ses klibinin başından itibaren saniye cinsinden: 0.0 ile ${maxDur.toFixed(1)} arasında) listele.
-- Zaman damgaları kesinlikle artan sırada ve ses kaydındaki gerçek konuşma anlarıyla uyumlu olsun.
-- Özetleme yapma, konuşulan tüm kelimeleri ve özel isimleri (tarih, yer, yazma adları) doğru Türkçe imlayla yaz.
-- Sadece geçerli JSON döndür.`;
+      const listenUrl =
+        `${DEEPGRAM_LISTEN_BASE_URL}?model=${encodeURIComponent(deepgramModel)}` +
+        '&language=tr&smart_format=true&punctuate=true&utterances=true&paragraphs=true';
 
-      const response = await ai.models.generateContent({
-        model,
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType,
-                data: audioBase64,
-              },
-            },
-            { text: prompt },
-          ],
+      const dgRes = await fetch(listenUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Token ${deepgramApiKey}`,
+          'Content-Type': 'audio/wav',
         },
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                startSec: {
-                  type: Type.NUMBER,
-                  description: 'Segment start time in seconds from start of this clip.',
-                },
-                endSec: {
-                  type: Type.NUMBER,
-                  description: 'Segment end time in seconds from start of this clip.',
-                },
-                text: {
-                  type: Type.STRING,
-                  description: 'Spoken Turkish text in this segment.',
-                },
-              },
-              required: ['startSec', 'endSec', 'text'],
-            },
-          },
-        },
+        body: new Uint8Array(wavBuffer),
       });
 
-      const rawText = (response.text ?? '[]')
-        .trim()
-        .replace(/^```(?:json)?\s*/i, '')
-        .replace(/```\s*$/i, '')
-        .trim();
-
-      let parsed: Array<{ startSec?: unknown; endSec?: unknown; text?: string }> = [];
-      try {
-        const obj = JSON.parse(rawText);
-        parsed = Array.isArray(obj) ? obj : Array.isArray(obj?.segments) ? obj.segments : [];
-      } catch {
-        // Fallback parser if model emitted [MM:SS - MM:SS] lines
-        const lines = rawText.split('\n');
-        for (const line of lines) {
-          const m = line.match(/\[?(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–]\s*(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*(.+)/);
-          if (m) {
-            parsed.push({
-              startSec: parseTimestampToSec(m[1]),
-              endSec: parseTimestampToSec(m[2]),
-              text: m[3].trim(),
-            });
-          }
-        }
+      if (dgRes.status === 429) {
+        const retryAfterSec = parseRetryAfterSec(dgRes.headers.get('retry-after'));
+        res.status(429).json({
+          error: `Deepgram hız sınırına ulaşıldı (429). ${retryAfterSec} saniye sonra otomatik yeniden denenecek.`,
+          retryAfterSec,
+          retryable: true,
+          upstreamStatus: 429,
+        });
+        return;
       }
 
-      const segments = parsed
-        .map((seg) => {
-          const start = Math.min(maxDur, Math.max(0, parseTimestampToSec(seg.startSec)));
-          const endRaw = parseTimestampToSec(seg.endSec);
-          const end = Math.min(maxDur, Math.max(start + 0.2, endRaw || start + 4));
-          return {
-            startSec: Number(start.toFixed(2)),
-            endSec: Number(end.toFixed(2)),
-            text: String(seg.text || '').trim(),
+      if (!dgRes.ok) {
+        const rawErrText = await dgRes.text().catch(() => '');
+        let upstreamMsg = rawErrText.trim();
+        try {
+          const parsedErr = JSON.parse(rawErrText) as {
+            err_msg?: string;
+            message?: string;
+            error?: string | { message?: string };
           };
-        })
-        .filter((seg) => seg.text.length > 0)
-        .sort((a, b) => a.startSec - b.startSec);
+          upstreamMsg =
+            parsedErr?.err_msg ||
+            parsedErr?.message ||
+            (typeof parsedErr?.error === 'string' ? parsedErr.error : parsedErr?.error?.message) ||
+            upstreamMsg;
+        } catch {
+          // keep plain text
+        }
 
+        const upstreamStatus = dgRes.status;
+        // CRITICAL: Map nginx-intercepted 403/502/503/504 to safe JSON statuses
+        if (upstreamStatus === 401 || upstreamStatus === 403) {
+          res.status(401).json({
+            error: 'Deepgram API anahtarı geçersiz veya yetkisiz.',
+            upstreamStatus,
+            retryable: false,
+          });
+          return;
+        }
+        if (upstreamStatus === 502 || upstreamStatus === 503 || upstreamStatus === 504) {
+          const retryAfterSec = parseRetryAfterSec(dgRes.headers.get('retry-after'));
+          res.status(429).json({
+            error: `Deepgram sunucusu geçici olarak yoğun (${upstreamStatus}). Kısa beklemenin ardından otomatik yeniden denenecek.`,
+            retryAfterSec,
+            retryable: true,
+            upstreamStatus,
+          });
+          return;
+        }
+
+        const safeStatus = upstreamStatus >= 400 && upstreamStatus < 500 ? upstreamStatus : 500;
+        res.status(safeStatus).json({
+          error: upstreamMsg
+            ? `Deepgram hatası (${upstreamStatus}): ${upstreamMsg}`
+            : `Deepgram isteği başarısız oldu (${upstreamStatus}).`,
+          upstreamStatus,
+          retryable: false,
+        });
+        return;
+      }
+
+      const dgData = (await dgRes.json()) as DeepgramListenResponse;
+      const relativeSegments = extractDeepgramRelativeSegments(dgData);
+      const maxChunkEndSec = chunkOffsetSec + chunkDurationSec + 0.5;
+      const segments: Array<{ startSec: number; endSec: number; text: string }> = [];
+
+      for (const seg of relativeSegments) {
+        const text = seg.text.trim();
+        if (!text) continue;
+
+        const clampedStart = Math.max(
+          chunkOffsetSec,
+          Math.min(maxChunkEndSec, seg.start + chunkOffsetSec)
+        );
+        const clampedEnd = Math.min(maxChunkEndSec, seg.end + chunkOffsetSec);
+
+        const startSec = Number(clampedStart.toFixed(2));
+        const endSec = Number(clampedEnd.toFixed(2));
+
+        if (endSec <= startSec) continue;
+        segments.push({ startSec, endSec, text });
+      }
+
+      segments.sort((a, b) => a.startSec - b.startSec);
       res.json({ segments });
     } catch (err) {
-      const parsedErr = parseErrorStatus(err);
-      res.status(parsedErr.status).json({ error: parsedErr.message, code: parsedErr.code });
+      const errMsg =
+        err instanceof Error ? err.message : 'Deepgram isteği sırasında beklenmeyen bir ağ hatası oluştu.';
+      console.error('[/api/transcribe-chunk] unexpected error:', errMsg);
+      res.status(429).json({
+        error: `Deepgram bağlantısı geçici olarak kesildi. Otomatik yeniden denenecek. (${errMsg})`,
+        retryAfterSec: 10,
+        retryable: true,
+      });
     }
   });
 
@@ -248,7 +564,7 @@ Kurallar:
         transcriptSegments = [],
         images = [],
         totalAudioDuration = 0,
-        model = 'gemini-3.8-flash',
+        model = 'gemini-4-hydrogen',
       } = req.body as {
         transcriptSegments?: Array<{ startSec: number; endSec: number; text: string }>;
         images?: Array<{ orderNumber: number; filename: string; cleanTitle: string }>;
@@ -272,18 +588,22 @@ Kurallar:
         .map((img, idx) => `${idx + 1}. Sıra #${img.orderNumber} | Dosya: ${img.filename} | Konu Başlığı: ${img.cleanTitle}`)
         .join('\n');
 
-      const prompt = `Sen profesyonel bir Türkçe belgesel kurgu yönetmenisin.
-Aşağıda bir belgeselin tam zaman damgalı Türkçe transkripti (toplam süre: ${totalDur.toFixed(2)} saniye) ve sayısal sıraya dizilmiş ${images.length} adet görselin listesi var.
+      const prompt = `Sen ödüllü bir Türkçe belgesel kurgu yönetmenisin.
+Aşağıda bir belgeselin baştan sona zaman damgalı Türkçe transkripti (toplam süre: ${totalDur.toFixed(2)} saniye) ve sayısal sıraya dizilmiş ${images.length} adet görselin listesi var.
 
-Görevin: Her görseli, anlatıcının o görselin konusundan bahsetmeye başladığı TAM başlangıç saniyesine (startSec) yerleştirmek.
+Görevin: Her görseli, anlatıcının o görselin konusundan bahsetmeye BAŞLADIĞI tam saniyeye (startSec) milimetrik anlamsal doğrulukla yerleştirmek.
+
+ADIM ADIM STRATEJİN:
+1. Önce tüm transkripti 0.0 saniyeden ${totalDur.toFixed(1)} saniyeye kadar baştan sona oku ve belgeselin bölüm/konu akışını çıkar.
+2. Her görselin "Konu Başlığı" (cleanTitle) içindeki anahtar kavramları, özel isimleri (yer, dönem, kişi, yazma, eser, olay) ve eşanlamlı ifadeleri transkriptte tam olarak İLK geçtiği satırlarla eşleştir.
+3. Önce kesin eşleşen (çapa / anchor) görsellerin tam saniyelerini sabitle; arada kalan veya soyut/geçiş başlığına sahip görselleri, iki çapa arasındaki doğal cümle başlangıçlarına orantılı ve anlam akışına uygun biçimde yerleştir. Görselleri asla başa veya sona yığma.
 
 KESİN KURALLAR:
-1. Görsellerin sırası ASLA değişmez. Listede verilen 1'den ${images.length}'e kadar sırayla eşleştir.
-2. İlk görsel (index 0) KESİNLİKLE 0.0 saniyede başlamalıdır.
-3. Her görsel i, kendinden önceki görsel i-1'den KESİNLİKLE daha sonra başlamalıdır (startSec[i] > startSec[i-1], aralarında en az 2.0 saniye olacak şekilde).
-4. Tüm startSec değerleri 0.0 ile ${(totalDur - 2).toFixed(2)} arasında olmalıdır.
-5. Anlatıcının transkriptte dosya başlığıyla (cleanTitle) anlamsal olarak en net örtüştüğü cümlenin tam başlangıç saniyesini seç. Eğer bir görselin konusu transkriptte açık geçmiyorsa, önceki ve sonraki görsel arasına doğal bir cümle başlangıcına orantılı yerleştir.
-6. Her görsel için transkriptten eşleşen kısa alıntıyı (matchedExcerpt, en fazla 140 karakter) ekle.
+- Görsellerin sırası ASLA değişmez (1'den ${images.length}'e kadar birebir aynı sıra).
+- İlk görsel (index 0) KESİNLİKLE 0.0 saniyede başlamalıdır.
+- Her görsel i, kendinden önceki görsel i-1'den KESİNLİKLE daha sonra başlamalıdır (startSec[i] >= startSec[i-1] + 2.0).
+- Tüm startSec değerleri 0.0 ile ${(totalDur - 2).toFixed(2)} arasında ve tercihen ilgili transkript satırının tam startSec değerinde olmalıdır.
+- Her görsel için tam o startSec anındaki transkript cümlesinden birebir kısa alıntı (matchedExcerpt, en fazla 140 karakter) yaz.
 
 GÖRSEL LİSTESİ (${images.length} adet):
 ${imageListText}
@@ -339,12 +659,37 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
         matchedExcerpt?: string;
       }>;
 
-      res.json({ alignments: Array.isArray(parsed) ? parsed : [] });
+      res.json({ alignments: Array.isArray(parsed) ? parsed : [], modelUsed: model });
     } catch (err) {
       const parsedErr = parseErrorStatus(err);
-      res.status(parsedErr.status).json({ error: parsedErr.message, code: parsedErr.code });
+      console.error('[/api/align-images] error:', parsedErr.upstreamStatus, parsedErr.code, parsedErr.message);
+      res.status(parsedErr.httpStatus).json({
+        error: parsedErr.message,
+        code: parsedErr.code,
+        upstreamStatus: parsedErr.upstreamStatus,
+        retryable: parsedErr.retryable,
+      });
     }
   });
+
+  // Always return JSON for /api middleware errors (e.g. PayloadTooLargeError / invalid JSON)
+  app.use(
+    '/api',
+    (
+      err: { status?: number; type?: string; message?: string },
+      _req: Request,
+      res: Response,
+      _next: express.NextFunction
+    ) => {
+      const status = err?.type === 'entity.too.large' ? 413 : err?.status && err.status < 500 ? err.status : 500;
+      const msg =
+        err?.type === 'entity.too.large'
+          ? 'Gönderilen ses parçası sunucu boyut sınırını (32 MB) aştı.'
+          : err?.message || 'API isteği işlenirken beklenmeyen bir hata oluştu.';
+      console.error('[/api middleware error]:', status, msg);
+      res.status(status).json({ error: msg });
+    }
+  );
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -361,9 +706,12 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Belgesel Kurgu Asistanı sunucusu http://0.0.0.0:${PORT} adresinde hazır.`);
   });
+  server.requestTimeout = 300_000;
+  server.headersTimeout = 310_000;
+  server.keepAliveTimeout = 65_000;
 }
 
 startServer().catch((err) => {

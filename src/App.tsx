@@ -20,7 +20,9 @@ import {
 } from './utils/timelineMath';
 import {
   alignImagesWithTranscript,
+  clearTranscriptionCache,
   fetchServerHealth,
+  RetryNotice,
   TranscribeProgress,
   transcribeAudioInChunks,
 } from './services/editorApi';
@@ -49,24 +51,33 @@ export default function App() {
   }
 
   const saved = initial.current;
+  const hasSavedTimeline = Boolean(saved?.scenes && saved.scenes.length > 0);
 
   const [activeStep, setActiveStep] = useState<WizardStep>(
-    saved?.scenes && saved.scenes.length > 0 ? 2 : 1
+    hasSavedTimeline ? 2 : 1
   );
   const [settings, setSettings] = useState<EditorSettings>({
-    ...DEFAULT_EDITOR_SETTINGS,
-    ...(saved?.settings ?? {}),
+    deepgramApiKey: saved?.settings?.deepgramApiKey || DEFAULT_EDITOR_SETTINGS.deepgramApiKey,
+    deepgramModel:
+      saved?.settings?.deepgramModel === 'nova-2'
+        ? 'nova-2'
+        : DEFAULT_EDITOR_SETTINGS.deepgramModel,
+    alignmentModel: saved?.settings?.alignmentModel || DEFAULT_EDITOR_SETTINGS.alignmentModel,
+    customApiKey: saved?.settings?.customApiKey || DEFAULT_EDITOR_SETTINGS.customApiKey,
   });
   const [hasServerGeminiKey, setHasServerGeminiKey] = useState(true);
+  const [hasDeepgramKey, setHasDeepgramKey] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
 
   // Audio state (original file is NEVER modified or re-encoded)
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [audioObjectUrl, setAudioObjectUrl] = useState<string | null>(null);
-  const [audioFileName, setAudioFileName] = useState<string>(saved?.audioFileName || '');
+  const [audioFileName, setAudioFileName] = useState<string>(
+    hasSavedTimeline ? saved?.audioFileName || '' : ''
+  );
   const [totalAudioDuration, setTotalAudioDuration] = useState<number>(
-    Number(saved?.totalAudioDuration) || 0
+    hasSavedTimeline ? Number(saved?.totalAudioDuration) || 0 : 0
   );
 
   // Sequentially sorted local images
@@ -76,11 +87,17 @@ export default function App() {
   const [srtFileName, setSrtFileName] = useState<string>('');
   const [srtSegments, setSrtSegments] = useState<TranscriptSegment[]>([]);
 
-  // Core timeline & transcript state
+  // Core timeline, subtitle & transcript state
   const [zoomSpeedPerSec, setZoomSpeedPerSec] = useState<number>(
     typeof saved?.zoomSpeedPerSec === 'number' && saved.zoomSpeedPerSec >= 0.001
       ? saved.zoomSpeedPerSec
       : DEFAULT_ZOOM_SPEED_PER_SEC
+  );
+  const [burnSubtitles, setBurnSubtitles] = useState<boolean>(
+    Boolean(saved?.burnSubtitles)
+  );
+  const [alignmentModelUsed, setAlignmentModelUsed] = useState<string>(
+    saved?.alignmentModelUsed || ''
   );
   const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>(
     Array.isArray(saved?.transcriptSegments) ? saved.transcriptSegments : []
@@ -94,25 +111,35 @@ export default function App() {
     return rawScenes.length > 0 ? recalculateAllScenes(rawScenes, speed) : [];
   });
 
-  // Processing state
+  // Processing state (Step 1)
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState<TranscribeProgress | null>(null);
-  const [retryWaitSec, setRetryWaitSec] = useState<number | null>(null);
+  const [retryNotice, setRetryNotice] = useState<RetryNotice | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // Re-alignment state (Step 2)
+  const [isRealigning, setIsRealigning] = useState(false);
+  const [realignRetryNotice, setRealignRetryNotice] = useState<RetryNotice | null>(null);
+  const [realignError, setRealignError] = useState<string | null>(null);
+
   // Check server health once on mount
   useEffect(() => {
-    fetchServerHealth().then((h) => setHasServerGeminiKey(h.hasServerGeminiKey));
+    fetchServerHealth().then((h) => {
+      setHasServerGeminiKey(h.hasServerGeminiKey);
+      setHasDeepgramKey(h.hasDeepgramKey);
+    });
   }, []);
 
-  // Auto-save timeline, transcript, zoom speed & settings to localStorage
+  // Auto-save timeline, transcript, zoom speed, subtitles & settings to localStorage
   useEffect(() => {
     try {
       const payload: PersistedSession = {
         audioFileName,
         totalAudioDuration,
         zoomSpeedPerSec,
+        burnSubtitles,
+        alignmentModelUsed,
         transcriptSegments,
         scenes,
         settings,
@@ -121,7 +148,16 @@ export default function App() {
     } catch {
       // Ignore storage quota errors
     }
-  }, [audioFileName, totalAudioDuration, zoomSpeedPerSec, transcriptSegments, scenes, settings]);
+  }, [
+    audioFileName,
+    totalAudioDuration,
+    zoomSpeedPerSec,
+    burnSubtitles,
+    alignmentModelUsed,
+    transcriptSegments,
+    scenes,
+    settings,
+  ]);
 
   // Cleanup object URLs on unmount
   const audioUrlRef = useRef<string | null>(null);
@@ -167,7 +203,6 @@ export default function App() {
     for (const f of existingFiles) byName.set(f.name, f);
     for (const f of newFiles) byName.set(f.name, f);
 
-    // Revoke previous object URLs cleanly before rebuilding naturally sorted array
     for (const img of images) {
       if (img.objectUrl) URL.revokeObjectURL(img.objectUrl);
     }
@@ -201,6 +236,13 @@ export default function App() {
       }
       setSrtFileName(file.name);
       setSrtSegments(parsed);
+      // If no audio file is uploaded, automatically derive total duration from the last SRT timestamp
+      if (!audioFile) {
+        const lastEnd = parsed.reduce((max, s) => Math.max(max, s.endSec), 0);
+        if (lastEnd > 0) {
+          setTotalAudioDuration(Number(lastEnd.toFixed(2)));
+        }
+      }
     } catch {
       setErrorMessage('SRT dosyası okunamadı.');
     }
@@ -209,20 +251,37 @@ export default function App() {
   const handleClearSrt = () => {
     setSrtFileName('');
     setSrtSegments([]);
+    if (!audioFile && scenes.length === 0) {
+      setTotalAudioDuration(0);
+    }
   };
 
   const handleStartProcess = async () => {
-    if (images.length === 0) {
-      setErrorMessage('Lütfen en az bir görsel yükleyin.');
-      return;
-    }
     if (!audioFile && srtSegments.length === 0) {
-      setErrorMessage('Lütfen ses dosyasını yükleyin.');
+      setErrorMessage(
+        audioFileName
+          ? `Sayfa yenilendiği için tarayıcı "${audioFileName}" dosyasını bellekte tutamadı. Lütfen sol kutudan ses dosyasını veya bir .SRT dosyası seçin.`
+          : 'Lütfen sol kutudan bir ses dosyası (.mp3, .wav, .m4a) veya hazır .SRT transkript dosyası yükleyin.'
+      );
       return;
     }
-    if (totalAudioDuration <= 0) {
-      setErrorMessage('Ses dosyasının toplam süresi okunamadı. Lütfen ses dosyasını seçin.');
+
+    const effectiveDuration =
+      totalAudioDuration > 0
+        ? totalAudioDuration
+        : srtSegments.reduce((max, s) => Math.max(max, s.endSec), 0);
+
+    if (effectiveDuration <= 0) {
+      setErrorMessage('Toplam süre okunamadı. Geçerli bir ses veya .SRT dosyası seçin.');
       return;
+    }
+    if (images.length === 0) {
+      setErrorMessage('Lütfen sağ kutudan en az 1 sıralı görsel yükleyin.');
+      return;
+    }
+
+    if (effectiveDuration !== totalAudioDuration) {
+      setTotalAudioDuration(Number(effectiveDuration.toFixed(2)));
     }
 
     const controller = new AbortController();
@@ -230,7 +289,7 @@ export default function App() {
 
     setIsProcessing(true);
     setErrorMessage(null);
-    setRetryWaitSec(null);
+    setRetryNotice(null);
 
     try {
       let finalTranscript: TranscriptSegment[] = [];
@@ -241,28 +300,29 @@ export default function App() {
         finalTranscript = await transcribeAudioInChunks(audioFile, settings, {
           signal: controller.signal,
           onProgress: (p) => setProgress(p),
-          onRetryWait: (sec) => setRetryWaitSec(sec),
+          onRetryWait: (notice) => setRetryNotice(notice),
         });
       }
 
       if (controller.signal.aborted) return;
 
+      const preferredAlignModel = settings.alignmentModel || 'gemini-4-hydrogen';
       setProgress({
         phase: 'aligning',
         currentChunk: 1,
         totalChunks: 1,
-        message: `${images.length} sıralı görsel transkript ile eşleştiriliyor...`,
+        message: `${images.length} sıralı görsel ${preferredAlignModel} ile transkripte eşleştiriliyor...`,
       });
 
-      const alignedScenes = await alignImagesWithTranscript(
+      const { scenes: alignedScenes, modelUsed } = await alignImagesWithTranscript(
         finalTranscript,
         images,
-        totalAudioDuration,
+        effectiveDuration,
         zoomSpeedPerSec,
         settings,
         {
           signal: controller.signal,
-          onRetryWait: (sec) => setRetryWaitSec(sec),
+          onRetryWait: (notice) => setRetryNotice(notice),
         }
       );
 
@@ -270,6 +330,7 @@ export default function App() {
 
       setTranscriptSegments(finalTranscript);
       setScenes(alignedScenes);
+      setAlignmentModelUsed(modelUsed);
       setActiveStep(2);
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError') {
@@ -284,8 +345,52 @@ export default function App() {
     } finally {
       setIsProcessing(false);
       setProgress(null);
-      setRetryWaitSec(null);
+      setRetryNotice(null);
       abortControllerRef.current = null;
+    }
+  };
+
+  const handleRealignWithHydrogen = async () => {
+    if (transcriptSegments.length === 0 || scenes.length === 0 || isRealigning) return;
+
+    setIsRealigning(true);
+    setRealignError(null);
+    setRealignRetryNotice(null);
+
+    try {
+      const imageListForAlignment = scenes.map((sc) => ({
+        id: sc.id,
+        orderNumber: sc.orderNumber,
+        filename: sc.filename,
+        cleanTitle: sc.cleanTitle,
+        objectUrl: images.find((im) => im.filename === sc.filename)?.objectUrl || '',
+      }));
+
+      const hydrogenSettings: EditorSettings = {
+        ...settings,
+        alignmentModel: settings.alignmentModel || 'gemini-4-hydrogen',
+      };
+
+      const { scenes: alignedScenes, modelUsed } = await alignImagesWithTranscript(
+        transcriptSegments,
+        imageListForAlignment,
+        totalAudioDuration,
+        zoomSpeedPerSec,
+        hydrogenSettings,
+        {
+          onRetryWait: (notice) => setRealignRetryNotice(notice),
+        }
+      );
+
+      setScenes(alignedScenes);
+      setAlignmentModelUsed(modelUsed);
+    } catch (err) {
+      setRealignError(
+        err instanceof Error ? err.message : 'Yeniden eşleştirme sırasında hata oluştu.'
+      );
+    } finally {
+      setIsRealigning(false);
+      setRealignRetryNotice(null);
     }
   };
 
@@ -341,13 +446,17 @@ export default function App() {
 
   const handlePerformReset = () => {
     abortControllerRef.current?.abort();
+    clearTranscriptionCache();
     handleClearAudio();
     handleClearImages();
     handleClearSrt();
     setTranscriptSegments([]);
     setScenes([]);
+    setAlignmentModelUsed('');
+    setBurnSubtitles(false);
     setZoomSpeedPerSec(DEFAULT_ZOOM_SPEED_PER_SEC);
     setErrorMessage(null);
+    setRealignError(null);
     setActiveStep(1);
     setResetConfirmOpen(false);
     try {
@@ -358,8 +467,10 @@ export default function App() {
   };
 
   const canAccessStep2 = scenes.length > 0;
-  const canAccessStep3 = scenes.length > 0 && Boolean(audioFileName);
-  const hasAnyData = Boolean(audioFileName || images.length > 0 || scenes.length > 0);
+  const canAccessStep3 = scenes.length > 0;
+  const hasAnyData = Boolean(
+    audioFileName || srtFileName || images.length > 0 || scenes.length > 0
+  );
 
   return (
     <div className="flex min-h-screen flex-col bg-[#0B0F17] text-[#F1F5F9]">
@@ -384,7 +495,7 @@ export default function App() {
             srtSegments={srtSegments}
             isProcessing={isProcessing}
             progress={progress}
-            retryWaitSec={retryWaitSec}
+            retryNotice={retryNotice}
             errorMessage={errorMessage}
             hasExistingTimeline={scenes.length > 0}
             onSelectAudio={handleSelectAudio}
@@ -406,10 +517,17 @@ export default function App() {
             audioObjectUrl={audioObjectUrl}
             totalAudioDuration={totalAudioDuration}
             zoomSpeedPerSec={zoomSpeedPerSec}
+            burnSubtitles={burnSubtitles}
+            alignmentModelUsed={alignmentModelUsed}
+            isRealigning={isRealigning}
+            realignRetryNotice={realignRetryNotice}
+            realignError={realignError}
             transcriptSegments={transcriptSegments}
             scenes={scenes}
             images={images}
             onChangeZoomSpeed={handleChangeZoomSpeed}
+            onToggleSubtitles={setBurnSubtitles}
+            onRealignWithHydrogen={handleRealignWithHydrogen}
             onAdjustSceneDuration={handleAdjustSceneDuration}
             onToggleZoomDirection={handleToggleZoomDirection}
             onReattachAudio={handleReattachAudio}
@@ -423,7 +541,11 @@ export default function App() {
             audioFileName={audioFileName}
             totalAudioDuration={totalAudioDuration}
             zoomSpeedPerSec={zoomSpeedPerSec}
+            burnSubtitles={burnSubtitles}
+            transcriptSegments={transcriptSegments}
             scenes={scenes}
+            onChangeAudioFileName={setAudioFileName}
+            onToggleSubtitles={setBurnSubtitles}
             onBackToTimeline={() => setActiveStep(2)}
           />
         )}
@@ -434,6 +556,7 @@ export default function App() {
         open={settingsOpen}
         settings={settings}
         hasServerGeminiKey={hasServerGeminiKey}
+        hasDeepgramKey={hasDeepgramKey}
         onSave={(next) => setSettings(next)}
         onClose={() => setSettingsOpen(false)}
       />

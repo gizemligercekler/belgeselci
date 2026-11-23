@@ -31,9 +31,13 @@ export interface TimelineScene {
   matchedExcerpt: string;
 }
 
+export type DeepgramModel = 'nova-3' | 'nova-2';
+
 export interface EditorSettings {
-  model: string; // default 'gemini-3.8-flash'
-  customApiKey: string; // optional single key override for local PC use
+  deepgramApiKey: string; // Optional Deepgram API key override (console.deepgram.com)
+  deepgramModel: DeepgramModel; // Deepgram Pre-Recorded Audio model ('nova-3' | 'nova-2')
+  alignmentModel: string; // Semantic image-to-transcript alignment model, default 'gemini-4-hydrogen'
+  customApiKey: string; // Optional Gemini API key override for image alignment
 }
 
 export interface ZoomSpeedPreset {
@@ -56,7 +60,9 @@ export const FIXED_DISSOLVE_SEC = 1.0;
 export const MIN_SCENE_DURATION_SEC = 2.0;
 
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
-  model: 'gemini-3.8-flash',
+  deepgramApiKey: '',
+  deepgramModel: 'nova-3',
+  alignmentModel: 'gemini-4-hydrogen',
   customApiKey: '',
 };
 
@@ -64,6 +70,8 @@ export interface PersistedSession {
   audioFileName: string;
   totalAudioDuration: number;
   zoomSpeedPerSec: number;
+  burnSubtitles: boolean;
+  alignmentModelUsed: string;
   transcriptSegments: TranscriptSegment[];
   scenes: TimelineScene[];
   settings: EditorSettings;
