@@ -1,4 +1,4 @@
-import { TranscriptSegment, UploadedImage } from '../types/editor';
+import { TimingPlanEntry, TranscriptSegment, UploadedImage } from '../types/editor';
 
 const NATURAL_COLLATOR = new Intl.Collator('tr', { numeric: true, sensitivity: 'base' });
 
@@ -14,7 +14,7 @@ export function parseImageFilename(filename: string): {
   cleanTitle: string;
 } {
   const withoutExt = filename.replace(/\.[^.]+$/, '').trim();
-  const leadingMatch = withoutExt.match(/^(\d+)\s*[.\-_)\]:\s]*(.*)$/);
+  const leadingMatch = withoutExt.match(/^[#(\[\s]*(\d+)\s*[.\-_)\]:\s]*(.*)$/);
 
   let orderNumber = Number.MAX_SAFE_INTEGER;
   let hasExplicitNumber = false;
@@ -25,10 +25,20 @@ export function parseImageFilename(filename: string): {
     hasExplicitNumber = true;
     titleRaw = leadingMatch[2] || withoutExt;
   } else {
-    const anyNum = withoutExt.match(/(\d+)/);
-    if (anyNum) {
-      orderNumber = parseInt(anyNum[1], 10);
+    const labeledNum = withoutExt.match(
+      /(?:sahne|resim|g[öo]rsel|foto|kare|scene|image|img|slide|no|#)\s*[:._\-\s]*(\d+)/i
+    );
+    if (labeledNum) {
+      orderNumber = parseInt(labeledNum[1], 10);
       hasExplicitNumber = true;
+    } else {
+      const allNums = Array.from(withoutExt.matchAll(/\d+/g)).map((m) => parseInt(m[0], 10));
+      const nonYear = allNums.find((n) => n < 1800 || n > 2100);
+      const chosen = nonYear ?? allNums[0];
+      if (chosen !== undefined) {
+        orderNumber = chosen;
+        hasExplicitNumber = true;
+      }
     }
   }
 
@@ -329,4 +339,179 @@ export function segmentsToSrt(segments: TranscriptSegment[]): string {
         `${idx + 1}\n${secToSrtTimestamp(seg.startSec)} --> ${secToSrtTimestamp(seg.endSec)}\n${seg.text}`
     )
     .join('\n\n');
+}
+
+function parseClockTimestampToSec(raw: string): number | null {
+  const cleaned = raw.trim().replace(',', '.');
+  const parts = cleaned.split(':').map((p) => Number(p));
+  if (parts.some((n) => !Number.isFinite(n) || n < 0)) return null;
+  if (parts.length === 3) {
+    return Number((parts[0] * 3600 + parts[1] * 60 + parts[2]).toFixed(2));
+  }
+  if (parts.length === 2) {
+    return Number((parts[0] * 60 + parts[1]).toFixed(2));
+  }
+  return null;
+}
+
+function parseExplicitDurationSec(line: string): number | null {
+  // Supports e.g. "(17 saniye)", "25 sn", "1 dk 20 sn", "1 dakika 15 saniye"
+  const minSecMatch = line.match(
+    /(\d+(?:[.,]\d+)?)\s*(?:dakika|dk\.?)\s*(\d+(?:[.,]\d+)?)?\s*(?:saniye|sn\.?)?/i
+  );
+  if (minSecMatch) {
+    const mins = Number(minSecMatch[1].replace(',', '.'));
+    const secs = minSecMatch[2] ? Number(minSecMatch[2].replace(',', '.')) : 0;
+    if (Number.isFinite(mins) && Number.isFinite(secs)) {
+      const total = mins * 60 + secs;
+      if (total > 0) return Number(total.toFixed(2));
+    }
+  }
+
+  const secMatch = line.match(/(?:^|[\s(:=\-])(\d+(?:[.,]\d+)?)\s*(?:saniye|sn\.?|sec(?:onds?)?)\b/i);
+  if (secMatch) {
+    const secs = Number(secMatch[1].replace(',', '.'));
+    if (Number.isFinite(secs) && secs > 0) return Number(secs.toFixed(2));
+  }
+  return null;
+}
+
+const TIME_RANGE_RE =
+  /(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)\s*(?:-->|->|[-–—])\s*(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)/;
+const CLOCK_START_RE = /^\d{1,2}:\d{2}/;
+const TIMING_LABEL_RE = /^(?:zaman|süre|sure|aralık|aralik|time|duration)\s*:/i;
+const NUMBERED_HEADING_RE =
+  /^(?:(?:sahne|görsel|gorsel|resim|klip|kare)\s*#?\s*)?(\d+)\s*[.):\-]\s*(.+)$/i;
+
+/**
+ * Parses a Turkish scene timing plan .txt file such as:
+ *   1. Ypsilanti Akıl Hastanesi Koğuşu (1959)
+ *   Zaman: 00:00:00 - 00:00:17 (17 saniye)
+ *
+ * Also handles single-line entries, MM:SS or HH:MM:SS ranges, markdown bold (**1. ...**),
+ * and duration-only lines ("Süre: 17 saniye").
+ */
+export function parseTimingPlanTxt(txtContent: string): TimingPlanEntry[] {
+  const normalized = txtContent.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  const rawLines = normalized
+    .split('\n')
+    .map((l) =>
+      l
+        .trim()
+        .replace(/^#+\s*/, '')
+        .replace(/^\*{1,2}(.+?)\*{1,2}$/, '$1')
+        .replace(/^[-•*]\s+/, '')
+        .trim()
+    )
+    .filter(Boolean);
+
+  const entries: TimingPlanEntry[] = [];
+  let pending: { orderNumber: number; title: string } | null = null;
+  let runningCursor = 0;
+
+  const pushTiming = (
+    orderNumber: number,
+    title: string,
+    startSec: number,
+    endSec: number,
+    explicitDur: number | null
+  ) => {
+    const safeStart = Math.max(0, Number(startSec.toFixed(2)));
+    let safeEnd = Number(endSec.toFixed(2));
+    if (safeEnd <= safeStart && explicitDur && explicitDur > 0) {
+      safeEnd = Number((safeStart + explicitDur).toFixed(2));
+    }
+    const durationSec = Number(Math.max(0.5, safeEnd - safeStart).toFixed(2));
+    safeEnd = Number((safeStart + durationSec).toFixed(2));
+
+    entries.push({
+      orderNumber,
+      title: title.trim() || `Sahne ${orderNumber}`,
+      startSec: safeStart,
+      endSec: safeEnd,
+      durationSec,
+    });
+    runningCursor = Math.max(runningCursor, safeEnd);
+  };
+
+  for (const line of rawLines) {
+    const rangeMatch = line.match(TIME_RANGE_RE);
+    const explicitDur = parseExplicitDurationSec(line);
+    const isTimingLabelLine = TIMING_LABEL_RE.test(line);
+    const startsWithClock = CLOCK_START_RE.test(line);
+
+    // Check if this line is a numbered scene header (not a clock timestamp or "Zaman: ...")
+    const headingMatch =
+      !isTimingLabelLine && !startsWithClock ? line.match(NUMBERED_HEADING_RE) : null;
+
+    if (headingMatch) {
+      const orderNumber = parseInt(headingMatch[1], 10);
+      const rawTitle = headingMatch[2].trim();
+
+      if (rangeMatch) {
+        // Single-line entry: "1. Başlık - 00:00:00 - 00:00:17 (17 saniye)"
+        const start = parseClockTimestampToSec(rangeMatch[1]);
+        const end = parseClockTimestampToSec(rangeMatch[2]);
+        const cleanTitle = rawTitle
+          .replace(TIME_RANGE_RE, '')
+          .replace(/\(?\s*\d+(?:[.,]\d+)?\s*(?:saniye|sn\.?|dakika|dk\.?)\s*\)?/gi, '')
+          .replace(/[\s\-–—|:]+$/, '')
+          .trim();
+
+        if (start !== null && end !== null) {
+          pushTiming(orderNumber, cleanTitle || rawTitle, start, end, explicitDur);
+          pending = null;
+          continue;
+        }
+      }
+
+      if (explicitDur !== null && /saniye|sn\.?|dakika|dk\.?/i.test(rawTitle)) {
+        // Single-line duration-only entry: "1. Başlık (17 saniye)"
+        const cleanTitle = rawTitle
+          .replace(/\(?\s*\d+(?:[.,]\d+)?\s*(?:dakika|dk\.?)\s*\d*\s*(?:saniye|sn\.?)?\s*\)?/gi, '')
+          .replace(/\(?\s*\d+(?:[.,]\d+)?\s*(?:saniye|sn\.?)\s*\)?/gi, '')
+          .replace(/[\s\-–—|:]+$/, '')
+          .trim();
+        pushTiming(
+          orderNumber,
+          cleanTitle || rawTitle,
+          runningCursor,
+          runningCursor + explicitDur,
+          explicitDur
+        );
+        pending = null;
+        continue;
+      }
+
+      pending = { orderNumber, title: rawTitle };
+      continue;
+    }
+
+    if (rangeMatch) {
+      const start = parseClockTimestampToSec(rangeMatch[1]);
+      const end = parseClockTimestampToSec(rangeMatch[2]);
+      if (start !== null && end !== null) {
+        const orderNumber = pending ? pending.orderNumber : entries.length + 1;
+        const title = pending
+          ? pending.title
+          : line
+              .replace(TIMING_LABEL_RE, '')
+              .replace(TIME_RANGE_RE, '')
+              .replace(/\(?\s*\d+(?:[.,]\d+)?\s*(?:saniye|sn\.?)\s*\)?/gi, '')
+              .trim();
+        pushTiming(orderNumber, title, start, end, explicitDur);
+        pending = null;
+        continue;
+      }
+    }
+
+    if ((isTimingLabelLine || pending) && explicitDur !== null) {
+      const orderNumber = pending ? pending.orderNumber : entries.length + 1;
+      const title = pending ? pending.title : `Sahne ${orderNumber}`;
+      pushTiming(orderNumber, title, runningCursor, runningCursor + explicitDur, explicitDur);
+      pending = null;
+    }
+  }
+
+  return entries.sort((a, b) => a.orderNumber - b.orderNumber || a.startSec - b.startSec);
 }

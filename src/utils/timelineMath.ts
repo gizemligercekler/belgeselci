@@ -2,6 +2,7 @@ import {
   FIXED_DISSOLVE_SEC,
   MIN_SCENE_DURATION_SEC,
   TimelineScene,
+  TimingPlanEntry,
   TranscriptSegment,
   UploadedImage,
   ZoomDirection,
@@ -262,6 +263,102 @@ export function buildValidatedTimeline(
       startScale: 1.0,
       endScale: 1.0,
       matchedExcerpt: aiExcerpt || fallbackExcerpt || img.cleanTitle,
+    };
+  });
+
+  return recalculateAllScenes(rawScenes, zoomSpeedPerSec);
+}
+
+/**
+ * Resolves how each uploaded image maps to an entry in the user's .txt timing plan
+ * (by exact orderNumber first, then positional fallback when entry count matches image count).
+ */
+export function matchImagesToTimingPlan(
+  images: Array<Pick<UploadedImage, 'id' | 'orderNumber' | 'filename' | 'cleanTitle'>>,
+  entries: TimingPlanEntry[]
+): Array<TimingPlanEntry | null> {
+  if (entries.length === 0) return images.map(() => null);
+
+  const byOrder = new Map<number, TimingPlanEntry>();
+  for (const entry of entries) {
+    if (!byOrder.has(entry.orderNumber)) {
+      byOrder.set(entry.orderNumber, entry);
+    }
+  }
+
+  const exactMatches = images.map((img) => byOrder.get(img.orderNumber) ?? null);
+  const exactCount = exactMatches.filter(Boolean).length;
+
+  // If all images matched by orderNumber, return exact map; otherwise allow clean 1:1 positional match when counts match
+  if (exactCount === images.length) return exactMatches;
+  if (entries.length === images.length) {
+    return images.map((img, idx) => byOrder.get(img.orderNumber) ?? entries[idx] ?? null);
+  }
+  return exactMatches;
+}
+
+/**
+ * Builds a validated, zero-gap, constant-zoom-speed TimelineScene array directly from the user's
+ * uploaded .txt timing plan while keeping every scene's requested start/end duration faithful.
+ */
+export function buildTimelineFromTimingPlan(
+  images: Array<Pick<UploadedImage, 'id' | 'orderNumber' | 'filename' | 'cleanTitle'>>,
+  entries: TimingPlanEntry[],
+  totalAudioDuration: number,
+  zoomSpeedPerSec: number,
+  transcriptSegments: TranscriptSegment[]
+): TimelineScene[] {
+  const n = images.length;
+  if (n === 0) return [];
+
+  const matched = matchImagesToTimingPlan(images, entries);
+  const planTotalEnd = entries.reduce((max, e) => Math.max(max, e.endSec), 0);
+  const safeTotal = round2(Math.max(n * 0.5, totalAudioDuration || planTotalEnd));
+  const minStep = safeTotal >= n * MIN_SCENE_DURATION_SEC ? MIN_SCENE_DURATION_SEC : round2(safeTotal / n);
+
+  const starts: number[] = new Array(n).fill(0);
+  starts[0] = 0;
+
+  for (let i = 1; i < n; i++) {
+    const prevEntry = matched[i - 1];
+    const currEntry = matched[i];
+    const minAllowed = round2(starts[i - 1] + minStep);
+    const maxAllowed = round2(safeTotal - (n - i) * minStep);
+
+    let candidate: number;
+    if (currEntry && Number.isFinite(currEntry.startSec)) {
+      candidate = currEntry.startSec;
+    } else if (prevEntry && Number.isFinite(prevEntry.durationSec)) {
+      candidate = starts[i - 1] + prevEntry.durationSec;
+    } else {
+      candidate = round2((i / n) * safeTotal);
+    }
+
+    if (candidate < minAllowed) candidate = minAllowed;
+    if (candidate > maxAllowed) candidate = maxAllowed;
+    starts[i] = round2(candidate);
+  }
+
+  const rawScenes: TimelineScene[] = images.map((img, idx) => {
+    const startSec = starts[idx];
+    const endSec = idx < n - 1 ? starts[idx + 1] : safeTotal;
+    const durationSec = round2(Math.max(0.5, endSec - startSec));
+    const planEntry = matched[idx];
+    const transcriptExcerpt = getExcerptAtTimestamp(transcriptSegments, startSec, endSec);
+
+    return {
+      id: `scene_${idx + 1}_${img.orderNumber}`,
+      orderNumber: img.orderNumber,
+      filename: img.filename,
+      cleanTitle: img.cleanTitle,
+      startSec,
+      endSec,
+      durationSec,
+      renderDurationSec: durationSec,
+      zoomDirection: defaultZoomDirectionForIndex(idx),
+      startScale: 1.0,
+      endScale: 1.0,
+      matchedExcerpt: transcriptExcerpt || planEntry?.title || img.cleanTitle,
     };
   });
 

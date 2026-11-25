@@ -1,6 +1,7 @@
 import {
   EditorSettings,
   TimelineScene,
+  TimingPlanEntry,
   TranscriptSegment,
   UploadedImage,
 } from '../types/editor';
@@ -423,7 +424,7 @@ export async function alignImagesWithTranscript(
   totalAudioDuration: number,
   zoomSpeedPerSec: number,
   settings: EditorSettings,
-  callbacks?: ApiCallOptions
+  callbacks?: ApiCallOptions & { timingPlan?: TimingPlanEntry[] }
 ): Promise<{ scenes: TimelineScene[]; modelUsed: string }> {
   const modelChain = buildAlignmentModelChain(settings.alignmentModel);
 
@@ -453,6 +454,7 @@ export async function alignImagesWithTranscript(
           })),
           totalAudioDuration,
           model: modelName,
+          timingPlan: callbacks?.timingPlan ?? [],
         }),
       };
     },

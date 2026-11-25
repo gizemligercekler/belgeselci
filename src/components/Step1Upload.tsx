@@ -4,6 +4,7 @@ import {
   Images,
   Upload,
   FileText,
+  ListOrdered,
   X,
   ArrowRight,
   Trash2,
@@ -11,7 +12,7 @@ import {
   ShieldCheck,
   AlertCircle,
 } from 'lucide-react';
-import { TranscriptSegment, UploadedImage } from '../types/editor';
+import { TimingPlanEntry, TranscriptSegment, UploadedImage } from '../types/editor';
 import { formatMMSS } from '../utils/timelineMath';
 import { RetryNotice, TranscribeProgress } from '../services/editorApi';
 
@@ -22,6 +23,8 @@ interface Step1UploadProps {
   images: UploadedImage[];
   srtFileName: string;
   srtSegments: TranscriptSegment[];
+  timingPlanFileName: string;
+  timingPlanEntries: TimingPlanEntry[];
   isProcessing: boolean;
   progress: TranscribeProgress | null;
   retryNotice: RetryNotice | null;
@@ -34,6 +37,8 @@ interface Step1UploadProps {
   onClearImages: () => void;
   onUploadSrt: (file: File) => void;
   onClearSrt: () => void;
+  onUploadTimingPlan: (file: File) => void;
+  onClearTimingPlan: () => void;
   onStartProcess: () => void;
   onCancelProcess: () => void;
   onGoToExistingTimeline: () => void;
@@ -46,6 +51,8 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
   images,
   srtFileName,
   srtSegments,
+  timingPlanFileName,
+  timingPlanEntries,
   isProcessing,
   progress,
   retryNotice,
@@ -58,6 +65,8 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
   onClearImages,
   onUploadSrt,
   onClearSrt,
+  onUploadTimingPlan,
+  onClearTimingPlan,
   onStartProcess,
   onCancelProcess,
   onGoToExistingTimeline,
@@ -65,17 +74,24 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
   const audioInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const srtInputRef = useRef<HTMLInputElement>(null);
+  const txtInputRef = useRef<HTMLInputElement>(null);
 
   const [audioDragOver, setAudioDragOver] = useState(false);
   const [imagesDragOver, setImagesDragOver] = useState(false);
 
-  const needsAudioReattach = Boolean(audioFileName && !audioFile && srtSegments.length === 0);
+  const planTotalSec = timingPlanEntries.reduce((max, e) => Math.max(max, e.endSec), 0);
+  const needsAudioReattach = Boolean(
+    audioFileName && !audioFile && srtSegments.length === 0 && timingPlanEntries.length === 0
+  );
   const hasSourceReady =
-    totalAudioDuration > 0 && Boolean(audioFile || srtSegments.length > 0);
+    totalAudioDuration > 0 &&
+    Boolean(audioFile || srtSegments.length > 0 || timingPlanEntries.length > 0);
   const isReadyToProcess = hasSourceReady && images.length > 0;
 
   const handleAudioOrSrtFile = (file: File) => {
-    if (/\.srt$/i.test(file.name)) {
+    if (/\.txt$/i.test(file.name)) {
+      onUploadTimingPlan(file);
+    } else if (/\.srt$/i.test(file.name)) {
       onUploadSrt(file);
     } else {
       onSelectAudio(file);
@@ -142,9 +158,9 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-sm font-medium text-[#F1F5F9]">
                 <FileAudio className="h-4 w-4 text-[#D99B26]" />
-                <span>Ses Dosyası veya .SRT Transkript</span>
+                <span>Ses Dosyası, .SRT veya .TXT Plan</span>
               </div>
-              <span className="font-mono text-[11px] text-[#64748B]">MP3 · WAV · M4A · SRT</span>
+              <span className="font-mono text-[11px] text-[#64748B]">MP3 · WAV · SRT · TXT</span>
             </div>
 
             {/* Dropzone */}
@@ -156,10 +172,10 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               onDragLeave={() => setAudioDragOver(false)}
               onDrop={handleAudioDrop}
               onClick={() => !isProcessing && audioInputRef.current?.click()}
-              className={`group flex min-h-[180px] cursor-pointer flex-col items-center justify-center rounded-md border border-dashed p-6 text-center transition-colors ${
+              className={`group flex min-h-[168px] cursor-pointer flex-col items-center justify-center rounded-md border border-dashed p-5 text-center transition-colors ${
                 audioDragOver
                   ? 'border-[#D99B26] bg-[#D99B26]/[0.06]'
-                  : audioFileName || srtSegments.length > 0
+                  : audioFileName || srtSegments.length > 0 || timingPlanEntries.length > 0
                     ? 'border-white/[0.14] bg-[#0B0F17]/70 hover:border-white/[0.24]'
                     : 'border-white/[0.12] bg-[#0B0F17]/50 hover:border-[#D99B26]/50 hover:bg-[#0B0F17]'
               }`}
@@ -167,7 +183,7 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               <input
                 ref={audioInputRef}
                 type="file"
-                accept=".mp3,.wav,.m4a,.aac,.flac,.srt,audio/*"
+                accept=".mp3,.wav,.m4a,.aac,.flac,.srt,.txt,audio/*"
                 className="hidden"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
@@ -217,14 +233,14 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
                   </div>
                   <div className="space-y-1">
                     <p className="text-sm font-medium text-[#E2E8F0]">
-                      {srtSegments.length > 0
+                      {srtSegments.length > 0 || timingPlanEntries.length > 0
                         ? 'İsteğe bağlı olarak ses dosyasını da ekleyebilirsiniz'
-                        : 'Ses dosyasını veya hazır .SRT dosyasını buraya bırakın'}
+                        : 'Ses dosyasını, .SRT veya .TXT süre planını buraya bırakın'}
                     </p>
                     <p className="text-xs text-[#64748B]">
-                      {srtSegments.length > 0
-                        ? 'Ses yüklemeden de doğrudan .SRT ile devam edebilirsiniz'
-                        : 'Ses yüklemeden yalnızca .SRT + görsellerle de çalışır'}
+                      {srtSegments.length > 0 || timingPlanEntries.length > 0
+                        ? 'Ses yüklemeden de doğrudan yüklü dosyayla devam edebilirsiniz'
+                        : 'Yalnızca .SRT veya .TXT süre planı + görsellerle de çalışır'}
                     </p>
                   </div>
                 </div>
@@ -241,8 +257,8 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
             </div>
           </div>
 
-          {/* Subtle Secondary Optional .srt Upload */}
-          <div className="border-t border-white/[0.06] pt-4">
+          {/* Subtle Secondary Optional .srt & .txt Timing Plan Uploads */}
+          <div className="space-y-3 border-t border-white/[0.06] pt-4">
             <input
               ref={srtInputRef}
               type="file"
@@ -251,6 +267,18 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               onChange={(e) => {
                 const file = e.target.files?.[0];
                 if (file) onUploadSrt(file);
+                e.target.value = '';
+              }}
+            />
+
+            <input
+              ref={txtInputRef}
+              type="file"
+              accept=".txt,text/plain"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) onUploadTimingPlan(file);
                 e.target.value = '';
               }}
             />
@@ -286,13 +314,60 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
                   type="button"
                   disabled={isProcessing}
                   onClick={() => srtInputRef.current?.click()}
-                  className="flex items-center gap-1.5 rounded-md border border-white/[0.12] bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9] disabled:opacity-50"
+                  className="flex shrink-0 items-center gap-1.5 rounded-md border border-white/[0.12] bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9] disabled:opacity-50"
                 >
                   <FileText className="h-3.5 w-3.5 text-[#D99B26]" />
                   <span>.SRT Yükle</span>
                 </button>
               </div>
             )}
+
+            {/* Optional .txt Scene Timing Plan */}
+            <div className="border-t border-white/[0.05] pt-3">
+              {timingPlanEntries.length > 0 ? (
+                <div className="flex items-center justify-between gap-2 rounded-md border border-[#D99B26]/30 bg-[#0B0F17] px-3 py-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <ListOrdered className="h-4 w-4 shrink-0 text-[#D99B26]" />
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-medium text-[#E2E8F0]">
+                        {timingPlanFileName || 'Sahne Süre Planı (.txt)'}
+                      </p>
+                      <p className="font-mono text-[11px] tabular-nums text-[#D99B26]">
+                        {timingPlanEntries.length} sahne süresi · toplam {formatMMSS(planTotalSec)}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onClearTimingPlan}
+                    title="Süre planı (.txt) dosyasını kaldır"
+                    className="rounded p-1 text-[#64748B] hover:bg-white/[0.05] hover:text-rose-400"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs text-[#64748B]">
+                      Görsel sürelerini belirleyen sahne planı (.txt):
+                    </span>
+                    <button
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={() => txtInputRef.current?.click()}
+                      className="flex shrink-0 items-center gap-1.5 rounded-md border border-white/[0.12] bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9] disabled:opacity-50"
+                    >
+                      <ListOrdered className="h-3.5 w-3.5 text-[#D99B26]" />
+                      <span>.TXT Yükle</span>
+                    </button>
+                  </div>
+                  <p className="font-mono text-[10px] text-[#475569]">
+                    Örn: 1. Başlık · Zaman: 00:00:00 - 00:00:17 (17 saniye)
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
         </section>
 
@@ -484,9 +559,11 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
           <div className="flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
             <div className="space-y-0.5 text-xs text-[#94A3B8]">
               <p className="font-medium text-[#CBD5E1]">
-                {srtSegments.length > 0
-                  ? 'Hazır .SRT yüklü — doğrudan görseller zaman çizelgesine eşleştirilecek.'
-                  : '5 dakikalık 16kHz WAV ile Deepgram Türkçe transkript + sıralı görsel eşleştirme.'}
+                {timingPlanEntries.length > 0
+                  ? 'Sahne Süre Planı (.TXT) yüklü — görseller dosyadaki dakikalara göre yerleştirilecek.'
+                  : srtSegments.length > 0
+                    ? 'Hazır .SRT yüklü — doğrudan görseller zaman çizelgesine eşleştirilecek.'
+                    : '5 dakikalık 16kHz WAV ile Deepgram Türkçe transkript + sıralı görsel eşleştirme.'}
               </p>
               <p className="font-mono text-[11px] tabular-nums text-[#64748B]">
                 {needsAudioReattach ? (
@@ -494,11 +571,13 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
                     Ses dosyasını tekrar seçin ({audioFileName}) · Görsel: {images.length} adet
                   </span>
                 ) : audioFileName ? (
-                  `Ses: ${formatMMSS(totalAudioDuration)} · Görsel: ${images.length} adet`
+                  `Ses: ${formatMMSS(totalAudioDuration)}${timingPlanEntries.length > 0 ? ` · Plan: ${timingPlanEntries.length} sahne (.TXT)` : ''} · Görsel: ${images.length} adet`
                 ) : srtSegments.length > 0 ? (
-                  `SRT: ${formatMMSS(totalAudioDuration)} (${srtSegments.length} satır) · Görsel: ${images.length} adet`
+                  `SRT: ${formatMMSS(totalAudioDuration)} (${srtSegments.length} satır)${timingPlanEntries.length > 0 ? ` · Plan: ${timingPlanEntries.length} sahne (.TXT)` : ''} · Görsel: ${images.length} adet`
+                ) : timingPlanEntries.length > 0 ? (
+                  `Süre Planı (.TXT): ${timingPlanEntries.length} sahne (${formatMMSS(totalAudioDuration)}) · Görsel: ${images.length} adet`
                 ) : (
-                  'Başlamak için 1 ses veya .SRT dosyası ve en az 1 görsel seçin.'
+                  'Başlamak için ses, .SRT veya .TXT süre planı ve en az 1 görsel seçin.'
                 )}
               </p>
             </div>
@@ -514,9 +593,11 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               }`}
             >
               <span>
-                {srtSegments.length > 0
-                  ? 'Resimleri .SRT ile Eşleştir'
-                  : 'Transkript Çıkar ve Resimleri Eşleştir'}
+                {timingPlanEntries.length > 0
+                  ? 'Süre Planı (.TXT) ile Kurguyu Oluştur'
+                  : srtSegments.length > 0
+                    ? 'Resimleri .SRT ile Eşleştir'
+                    : 'Transkript Çıkar ve Resimleri Eşleştir'}
               </span>
               <ArrowRight className="h-4 w-4" />
             </button>

@@ -16,6 +16,14 @@ export interface TranscriptSegment {
   text: string;
 }
 
+export interface TimingPlanEntry {
+  orderNumber: number;
+  title: string;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+}
+
 export interface TimelineScene {
   id: string;
   orderNumber: number;

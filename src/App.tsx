@@ -5,17 +5,21 @@ import {
   EditorSettings,
   PersistedSession,
   TimelineScene,
+  TimingPlanEntry,
   TranscriptSegment,
   UploadedImage,
   WizardStep,
 } from './types/editor';
 import {
   parseSrtToSegments,
+  parseTimingPlanTxt,
   readAudioDuration,
   sortAndParseImages,
 } from './utils/mediaUtils';
 import {
   adjustSceneDurationAdjacentOnly,
+  buildTimelineFromTimingPlan,
+  matchImagesToTimingPlan,
   recalculateAllScenes,
 } from './utils/timelineMath';
 import {
@@ -88,6 +92,10 @@ export default function App() {
   // Optional user-uploaded SRT
   const [srtFileName, setSrtFileName] = useState<string>('');
   const [srtSegments, setSrtSegments] = useState<TranscriptSegment[]>([]);
+
+  // Optional user-uploaded .txt scene timing plan
+  const [timingPlanFileName, setTimingPlanFileName] = useState<string>('');
+  const [timingPlanEntries, setTimingPlanEntries] = useState<TimingPlanEntry[]>([]);
 
   // Core timeline, subtitle & transcript state
   const [zoomSpeedPerSec, setZoomSpeedPerSec] = useState<number>(
@@ -195,7 +203,10 @@ export default function App() {
     setAudioFile(null);
     setAudioObjectUrl(null);
     setAudioFileName('');
-    setTotalAudioDuration(0);
+    const srtEnd = srtSegments.reduce((max, s) => Math.max(max, s.endSec), 0);
+    const planEnd = timingPlanEntries.reduce((max, e) => Math.max(max, e.endSec), 0);
+    const fallbackEnd = Math.max(srtEnd, planEnd);
+    setTotalAudioDuration(fallbackEnd > 0 ? Number(fallbackEnd.toFixed(2)) : 0);
   };
 
   const handleAddImages = (newFiles: File[]) => {
@@ -254,27 +265,62 @@ export default function App() {
     setSrtFileName('');
     setSrtSegments([]);
     if (!audioFile && scenes.length === 0) {
+      const planEnd = timingPlanEntries.reduce((max, e) => Math.max(max, e.endSec), 0);
+      setTotalAudioDuration(planEnd > 0 ? Number(planEnd.toFixed(2)) : 0);
+    }
+  };
+
+  const handleUploadTimingPlan = async (file: File) => {
+    setErrorMessage(null);
+    try {
+      const text = await file.text();
+      const parsed = parseTimingPlanTxt(text);
+      if (parsed.length === 0) {
+        setErrorMessage(
+          'TXT dosyasında geçerli sahne süresi bulunamadı. Örnek format: "1. Başlık" ve alt satırda "Zaman: 00:00:00 - 00:00:17 (17 saniye)".'
+        );
+        return;
+      }
+      setTimingPlanFileName(file.name);
+      setTimingPlanEntries(parsed);
+      if (!audioFile && srtSegments.length === 0) {
+        const lastEnd = parsed.reduce((max, e) => Math.max(max, e.endSec), 0);
+        if (lastEnd > 0) {
+          setTotalAudioDuration(Number(lastEnd.toFixed(2)));
+        }
+      }
+    } catch {
+      setErrorMessage('TXT süre planı dosyası okunamadı.');
+    }
+  };
+
+  const handleClearTimingPlan = () => {
+    setTimingPlanFileName('');
+    setTimingPlanEntries([]);
+    if (!audioFile && srtSegments.length === 0 && scenes.length === 0) {
       setTotalAudioDuration(0);
     }
   };
 
   const handleStartProcess = async () => {
-    if (!audioFile && srtSegments.length === 0) {
+    if (!audioFile && srtSegments.length === 0 && timingPlanEntries.length === 0) {
       setErrorMessage(
         audioFileName
-          ? `Sayfa yenilendiği için tarayıcı "${audioFileName}" dosyasını bellekte tutamadı. Lütfen sol kutudan ses dosyasını veya bir .SRT dosyası seçin.`
-          : 'Lütfen sol kutudan bir ses dosyası (.mp3, .wav, .m4a) veya hazır .SRT transkript dosyası yükleyin.'
+          ? `Sayfa yenilendiği için tarayıcı "${audioFileName}" dosyasını bellekte tutamadı. Lütfen sol kutudan ses dosyasını, bir .SRT veya .TXT süre planı seçin.`
+          : 'Lütfen sol kutudan bir ses dosyası (.mp3, .wav, .m4a), hazır .SRT transkripti veya .TXT süre planı yükleyin.'
       );
       return;
     }
 
+    const srtMaxEnd = srtSegments.reduce((max, s) => Math.max(max, s.endSec), 0);
+    const planMaxEnd = timingPlanEntries.reduce((max, e) => Math.max(max, e.endSec), 0);
     const effectiveDuration =
       totalAudioDuration > 0
         ? totalAudioDuration
-        : srtSegments.reduce((max, s) => Math.max(max, s.endSec), 0);
+        : Math.max(srtMaxEnd, planMaxEnd);
 
     if (effectiveDuration <= 0) {
-      setErrorMessage('Toplam süre okunamadı. Geçerli bir ses veya .SRT dosyası seçin.');
+      setErrorMessage('Toplam süre okunamadı. Geçerli bir ses, .SRT veya .TXT dosyası seçin.');
       return;
     }
     if (images.length === 0) {
@@ -284,6 +330,29 @@ export default function App() {
 
     if (effectiveDuration !== totalAudioDuration) {
       setTotalAudioDuration(Number(effectiveDuration.toFixed(2)));
+    }
+
+    // Direct exact timing path: if the uploaded .txt plan specifies timings for every uploaded image,
+    // construct the exact zero-gap constant-zoom timeline immediately with 100% fidelity to the .txt durations.
+    if (timingPlanEntries.length > 0) {
+      const matched = matchImagesToTimingPlan(images, timingPlanEntries);
+      const matchedCount = matched.filter(Boolean).length;
+
+      if (matchedCount === images.length) {
+        setErrorMessage(null);
+        const plannedScenes = buildTimelineFromTimingPlan(
+          images,
+          timingPlanEntries,
+          effectiveDuration,
+          zoomSpeedPerSec,
+          srtSegments
+        );
+        setTranscriptSegments(srtSegments);
+        setScenes(plannedScenes);
+        setAlignmentModelUsed('Süre Planı (.txt)');
+        setActiveStep(2);
+        return;
+      }
     }
 
     const controller = new AbortController();
@@ -313,7 +382,10 @@ export default function App() {
         phase: 'aligning',
         currentChunk: 1,
         totalChunks: 1,
-        message: `${images.length} sıralı görsel ${preferredAlignModel} ile transkripte eşleştiriliyor...`,
+        message:
+          timingPlanEntries.length > 0
+            ? `${images.length} görsel .TXT süre planı + ${preferredAlignModel} ile yerleştiriliyor...`
+            : `${images.length} sıralı görsel ${preferredAlignModel} ile transkripte eşleştiriliyor...`,
       });
 
       const { scenes: alignedScenes, modelUsed } = await alignImagesWithTranscript(
@@ -325,6 +397,7 @@ export default function App() {
         {
           signal: controller.signal,
           onRetryWait: (notice) => setRetryNotice(notice),
+          timingPlan: timingPlanEntries,
         }
       );
 
@@ -332,7 +405,9 @@ export default function App() {
 
       setTranscriptSegments(finalTranscript);
       setScenes(alignedScenes);
-      setAlignmentModelUsed(modelUsed);
+      setAlignmentModelUsed(
+        timingPlanEntries.length > 0 ? `${modelUsed} + .txt` : modelUsed
+      );
       setActiveStep(2);
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError') {
@@ -353,7 +428,9 @@ export default function App() {
   };
 
   const handleRealignWithHydrogen = async () => {
-    if (transcriptSegments.length === 0 || scenes.length === 0 || isRealigning) return;
+    if ((transcriptSegments.length === 0 && timingPlanEntries.length === 0) || scenes.length === 0 || isRealigning) {
+      return;
+    }
 
     setIsRealigning(true);
     setRealignError(null);
@@ -381,11 +458,14 @@ export default function App() {
         hydrogenSettings,
         {
           onRetryWait: (notice) => setRealignRetryNotice(notice),
+          timingPlan: timingPlanEntries,
         }
       );
 
       setScenes(alignedScenes);
-      setAlignmentModelUsed(modelUsed);
+      setAlignmentModelUsed(
+        timingPlanEntries.length > 0 ? `${modelUsed} + .txt` : modelUsed
+      );
     } catch (err) {
       setRealignError(
         err instanceof Error ? err.message : 'Yeniden eşleştirme sırasında hata oluştu.'
@@ -452,6 +532,8 @@ export default function App() {
     handleClearAudio();
     handleClearImages();
     handleClearSrt();
+    handleClearTimingPlan();
+    setTotalAudioDuration(0);
     setTranscriptSegments([]);
     setScenes([]);
     setAlignmentModelUsed('');
@@ -471,7 +553,7 @@ export default function App() {
   const canAccessStep2 = scenes.length > 0;
   const canAccessStep3 = scenes.length > 0;
   const hasAnyData = Boolean(
-    audioFileName || srtFileName || images.length > 0 || scenes.length > 0
+    audioFileName || srtFileName || timingPlanFileName || images.length > 0 || scenes.length > 0
   );
 
   const handleUseStandaloneTranscriptInEditor = (
@@ -526,6 +608,8 @@ export default function App() {
             images={images}
             srtFileName={srtFileName}
             srtSegments={srtSegments}
+            timingPlanFileName={timingPlanFileName}
+            timingPlanEntries={timingPlanEntries}
             isProcessing={isProcessing}
             progress={progress}
             retryNotice={retryNotice}
@@ -538,6 +622,8 @@ export default function App() {
             onClearImages={handleClearImages}
             onUploadSrt={handleUploadSrt}
             onClearSrt={handleClearSrt}
+            onUploadTimingPlan={handleUploadTimingPlan}
+            onClearTimingPlan={handleClearTimingPlan}
             onStartProcess={handleStartProcess}
             onCancelProcess={handleCancelProcess}
             onGoToExistingTimeline={() => setActiveStep(2)}

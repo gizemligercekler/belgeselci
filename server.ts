@@ -563,11 +563,19 @@ async function startServer() {
       const {
         transcriptSegments = [],
         images = [],
+        timingPlan = [],
         totalAudioDuration = 0,
         model = 'gemini-4-hydrogen',
       } = req.body as {
         transcriptSegments?: Array<{ startSec: number; endSec: number; text: string }>;
         images?: Array<{ orderNumber: number; filename: string; cleanTitle: string }>;
+        timingPlan?: Array<{
+          orderNumber: number;
+          title: string;
+          startSec: number;
+          endSec: number;
+          durationSec: number;
+        }>;
         totalAudioDuration?: number;
         model?: string;
       };
@@ -584,32 +592,81 @@ async function startServer() {
         .map((s) => `[${formatMMSS(s.startSec)} - ${formatMMSS(s.endSec)}] (${s.startSec.toFixed(1)}s) ${s.text}`)
         .join('\n');
 
+      const validTimingPlan = Array.isArray(timingPlan)
+        ? timingPlan.filter(
+            (t) =>
+              t &&
+              Number.isFinite(Number(t.orderNumber)) &&
+              Number.isFinite(Number(t.startSec)) &&
+              Number.isFinite(Number(t.endSec))
+          )
+        : [];
+
+      // Number-first lookup map: image orderNumber is the primary key regardless of title typos/missing words
+      const planByOrder = new Map<
+        number,
+        { orderNumber: number; title: string; startSec: number; endSec: number; durationSec: number }
+      >();
+      for (const t of validTimingPlan) {
+        const num = Number(t.orderNumber);
+        if (!planByOrder.has(num)) {
+          planByOrder.set(num, {
+            orderNumber: num,
+            title: String(t.title || ''),
+            startSec: Number(t.startSec),
+            endSec: Number(t.endSec),
+            durationSec: Number(t.durationSec),
+          });
+        }
+      }
+
       const imageListText = images
-        .map((img, idx) => `${idx + 1}. Sıra #${img.orderNumber} | Dosya: ${img.filename} | Konu Başlığı: ${img.cleanTitle}`)
+        .map((img, idx) => {
+          const matchedPlan = planByOrder.get(Number(img.orderNumber));
+          const lockTag = matchedPlan
+            ? ` | [NUMARA EŞLEŞMESİ KESİN #${matchedPlan.orderNumber} => startSec=${matchedPlan.startSec.toFixed(2)}s, bitiş=${matchedPlan.endSec.toFixed(2)}s (${matchedPlan.durationSec.toFixed(1)} sn)]`
+            : '';
+          return `${idx + 1}. Görsel Numarası: #${img.orderNumber} | Dosya: ${img.filename} | Konu Başlığı: ${img.cleanTitle}${lockTag}`;
+        })
         .join('\n');
+
+      const timingPlanBlock =
+        validTimingPlan.length > 0
+          ? `\nKULLANICI SÜRE PLANI (.TXT — ÖNCELİKLİ VE KESİN REFERANS):\n` +
+            `KRİTİK KURAL (NUMARA ÖNCELİĞİ): Görselleri sürelerle eşleştirirken İLK ÖNCE GÖRSEL NUMARASINA (#1, #2, #3...) bak!\n` +
+            `Görsel dosya adlarında veya başlıklarında eksik sözcük, harf hatası, kısaltma veya Türkçe karakter farkı olabilir. Başlık birebir tutmasa bile GÖRSEL NUMARASI (#N) ile plandaki NUMARA (#N) eşleşiyorsa, o görsel KESİNLİKLE plandaki o numaranın startSec değerine sabitlenmelidir.\n` +
+            `Listede numarası bulunmayan ara görseller varsa, iki sabit numara çapası arasına doğal biçimde yerleştir:\n` +
+            validTimingPlan
+              .map(
+                (t) =>
+                  `- Plan Numarası #${t.orderNumber} | Plan Başlığı: ${t.title} | Zaman: ${formatMMSS(Number(t.startSec))} - ${formatMMSS(Number(t.endSec))} (startSec=${Number(t.startSec).toFixed(2)}s, süre=${Number(t.durationSec).toFixed(1)} sn)`
+              )
+              .join('\n') +
+            '\n'
+          : '';
 
       const prompt = `Sen ödüllü bir Türkçe belgesel kurgu yönetmenisin.
 Aşağıda bir belgeselin baştan sona zaman damgalı Türkçe transkripti (toplam süre: ${totalDur.toFixed(2)} saniye) ve sayısal sıraya dizilmiş ${images.length} adet görselin listesi var.
 
-Görevin: Her görseli, anlatıcının o görselin konusundan bahsetmeye BAŞLADIĞI tam saniyeye (startSec) milimetrik anlamsal doğrulukla yerleştirmek.
+Görevin: Her görseli, ${validTimingPlan.length > 0 ? 'İLK ÖNCE GÖRSEL NUMARASINA (#1, #2, #3...) bakarak kullanıcının yüklediği SÜRE PLANI (.TXT) zamanlarına sabitlemek; numarası planda olmayan görselleri ise ' : ''}anlatıcının o görselin konusundan bahsetmeye BAŞLADIĞI tam saniyeye (startSec) milimetrik anlamsal doğrulukla yerleştirmek.
 
 ADIM ADIM STRATEJİN:
-1. Önce tüm transkripti 0.0 saniyeden ${totalDur.toFixed(1)} saniyeye kadar baştan sona oku ve belgeselin bölüm/konu akışını çıkar.
-2. Her görselin "Konu Başlığı" (cleanTitle) içindeki anahtar kavramları, özel isimleri (yer, dönem, kişi, yazma, eser, olay) ve eşanlamlı ifadeleri transkriptte tam olarak İLK geçtiği satırlarla eşleştir.
-3. Önce kesin eşleşen (çapa / anchor) görsellerin tam saniyelerini sabitle; arada kalan veya soyut/geçiş başlığına sahip görselleri, iki çapa arasındaki doğal cümle başlangıçlarına orantılı ve anlam akışına uygun biçimde yerleştir. Görselleri asla başa veya sona yığma.
+1. ${validTimingPlan.length > 0 ? 'İLK ÖNCELİK NUMARADIR: Görsel listesindeki "Görsel Numarası: #N" değerini SÜRE PLANI (.TXT) içindeki "Plan Numarası #N" ile eşleştir ve startSec değerini birebir uygula. Dosya adında eksik kelime, harf hatası veya küçük isim farkları olsa bile NUMARA EŞLEŞMESİ her zaman başlık metninden önceliklidir.' : `Önce tüm transkripti 0.0 saniyeden ${totalDur.toFixed(1)} saniyeye kadar baştan sona oku ve belgeselin bölüm/konu akışını çıkar.`}
+2. Numarası planda yer almayan (veya plan yoksa tüm) görseller için "Görsel Numarası" sırasını koruyarak "Konu Başlığı" (cleanTitle) içindeki anahtar kavramları transkriptle eşleştir. Dosya isimlerinde eksik sözcük, harf hatası veya Türkçe karakter farkı (ş/s, ğ/g, ç/c, ı/i, ö/o, ü/u) olabileceğini hesaba kat ve yaklaşık/anlamsal eşleşme yap.
+3. Önce kesin eşleşen (numara çapası veya net konu çapası) görsellerin tam saniyelerini sabitle; arada kalan veya kısa/eksik başlıklı görselleri iki çapa arasındaki doğal cümle başlangıçlarına orantılı biçimde yerleştir. Görselleri asla başa veya sona yığma.
 
 KESİN KURALLAR:
 - Görsellerin sırası ASLA değişmez (1'den ${images.length}'e kadar birebir aynı sıra).
 - İlk görsel (index 0) KESİNLİKLE 0.0 saniyede başlamalıdır.
 - Her görsel i, kendinden önceki görsel i-1'den KESİNLİKLE daha sonra başlamalıdır (startSec[i] >= startSec[i-1] + 2.0).
-- Tüm startSec değerleri 0.0 ile ${(totalDur - 2).toFixed(2)} arasında ve tercihen ilgili transkript satırının tam startSec değerinde olmalıdır.
-- Her görsel için tam o startSec anındaki transkript cümlesinden birebir kısa alıntı (matchedExcerpt, en fazla 140 karakter) yaz.
-
+- Tüm startSec değerleri 0.0 ile ${(totalDur - 2).toFixed(2)} arasında ve tercihen ilgili plan/transkript satırının tam startSec değerinde olmalıdır.
+- Her görsel için tam o startSec anındaki transkript cümlesinden (veya süre planı başlığından) birebir kısa alıntı (matchedExcerpt, en fazla 140 karakter) yaz.
+${timingPlanBlock}
 GÖRSEL LİSTESİ (${images.length} adet):
 ${imageListText}
 
 ZAMAN DAMGALI TRANSKRİPT:
-${transcriptText || '(Transkript metni boş; görselleri toplam süreye eşit dağıt.)'}
+${transcriptText || '(Transkript metni boş; süre planına göre veya toplam süreye eşit dağıt.)'}
 
 Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
 
@@ -659,7 +716,37 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
         matchedExcerpt?: string;
       }>;
 
-      res.json({ alignments: Array.isArray(parsed) ? parsed : [], modelUsed: model });
+      const aiAlignments = Array.isArray(parsed) ? parsed : [];
+
+      // Hard-enforce number-first matches from timingPlan so typos or missing words
+      // in image filenames can NEVER cause Gemini to shift a number-matched scene.
+      const finalAlignments =
+        planByOrder.size > 0
+          ? images.map((img, idx) => {
+              const aiItem =
+                aiAlignments.find((a) => a.index === idx) || aiAlignments[idx] || {};
+              const matchedPlan = planByOrder.get(Number(img.orderNumber));
+              if (matchedPlan) {
+                return {
+                  index: idx,
+                  filename: img.filename,
+                  startSec: idx === 0 ? 0 : matchedPlan.startSec,
+                  matchedExcerpt:
+                    (typeof aiItem.matchedExcerpt === 'string' && aiItem.matchedExcerpt.trim()) ||
+                    matchedPlan.title ||
+                    img.cleanTitle,
+                };
+              }
+              return {
+                index: idx,
+                filename: img.filename,
+                startSec: aiItem.startSec,
+                matchedExcerpt: aiItem.matchedExcerpt || img.cleanTitle,
+              };
+            })
+          : aiAlignments;
+
+      res.json({ alignments: finalAlignments, modelUsed: model });
     } catch (err) {
       const parsedErr = parseErrorStatus(err);
       console.error('[/api/align-images] error:', parsedErr.upstreamStatus, parsedErr.code, parsedErr.message);
