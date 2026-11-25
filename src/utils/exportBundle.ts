@@ -68,7 +68,8 @@ Belgesel Kurgu Asistani — 16:9 1080p Render Betigi
 Ozellikler:
 - Sabit hizli Ken Burns zoom (her klibin gercek render suresi L_i uzerinden hesaplanir;
   boylece 1 saniyelik dissolve gecisinde dahi zoom hizi birebir sabit kalir).
-- 2x (3840x2160) on-olcekleme ile titresimsiz, jilet gibi yumusak 1920x1080 @ 30fps cikti.
+- 1440p (2560x1440) 4:4:4 on-olcekleme + gercek alt-piksel (sub-pixel) perspective zoom
+  + Lanczos 1080p indirme ile sifir titresimli, Filmora akiciliginda 1920x1080 @ 30fps cikti.
 - 10'ar kliplik bellek-dostu toplu (batched) xfade birlestirme (sifir senkron kaymasi).
 - Istege bagli Turkce UTF-8 altyazi gomme (timeline.json icinde burnSubtitles=true ise
   subtitles.srt dosyasi sinematik okunakli stille videoya eklenir).
@@ -131,13 +132,25 @@ def render_single_clip(
     fps: int,
 ) -> None:
     frames = max(2, int(round(render_duration_sec * fps)))
-    zoom_expr = f"{start_scale:.6f}+({end_scale - start_scale:.6f})*min(on/{frames - 1},1)"
+    # FFmpeg'in zoompan filtresi x/y/w/h koordinatlarini her karede tam sayiya yuvarladigi
+    # icin yavas belgesel zoomlarinda titreme (jitter) yapar. Bunun yerine goruntuyu tek sefer
+    # 2560x1440 4:4:4 (yuv444p) olarak hazirlayip her karede alt-piksel (sub-pixel) perspective
+    # zoom uyguluyor ve Lanczos ile 1920x1080'e indiriyoruz (sifir titreme, maksimum netlik).
+    z_expr = f"({start_scale:.6f}+({end_scale - start_scale:.6f})*min(in/{frames - 1},1))"
+    x0 = f"(W-W/{z_expr})/2"
+    x1 = f"(W+W/{z_expr})/2"
+    y0 = f"(H-H/{z_expr})/2"
+    y2 = f"(H+H/{z_expr})/2"
     vf = (
-        "scale=3840:2160:force_original_aspect_ratio=increase,"
-        "crop=3840:2160,"
-        f"zoompan=z='{zoom_expr}':"
-        "x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':"
-        f"d={frames}:s=1920x1080:fps={fps},"
+        "scale=2560:1440:force_original_aspect_ratio=increase:flags=lanczos,"
+        "crop=2560:1440,"
+        "format=yuv444p,"
+        f"loop=loop={frames - 1}:size=1:start=0,"
+        f"setpts=N/({fps}*TB),"
+        f"perspective=x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':"
+        f"x2='{x0}':y2='{y2}':x3='{x1}':y3='{y2}':"
+        "interpolation=linear:sense=source:eval=frame,"
+        "scale=1920:1080:flags=lanczos,"
         "setsar=1,format=yuv420p"
     )
 
@@ -158,9 +171,9 @@ def render_single_clip(
         "-c:v",
         "libx264",
         "-crf",
-        "18",
+        "16",
         "-preset",
-        "medium",
+        "fast",
         "-pix_fmt",
         "yuv420p",
         "-video_track_timescale",
@@ -559,7 +572,7 @@ export function generateExportReadme(
 
   return `# Belgesel Kurgu Asistanı — Render Paketi
 
-Bu paket, **Belgesel Kurgu Asistanı** ile hazırladığınız zaman çizelgesini bilgisayarınızda yüksek kalitede (**1920×1080 @ 30fps**, sabit hızlı Ken Burns + **1.0 sn Dissolve**${cleanAudio ? ', orijinal ses dokunulmadan `-c:a copy`' : ''}) videoya dönüştürmek için gereken ${fileCount} hafif dosyayı içerir.
+Bu paket, **Belgesel Kurgu Asistanı** ile hazırladığınız zaman çizelgesini bilgisayarınızda yüksek kalitede (**1920×1080 @ 30fps**, alt-piksel titreşimsiz sabit hızlı Ken Burns + **1.0 sn Dissolve**${cleanAudio ? ', orijinal ses dokunulmadan `-c:a copy`' : ''}) videoya dönüştürmek için gereken ${fileCount} hafif dosyayı içerir.
 
 ## Proje Özeti
 - **Ses Dosyası:** ${cleanAudio ? `\`${cleanAudio}\` (${formatMMSS(totalAudioDuration)})` : `Belirtilmedi (Yalnızca 16:9 1080p görüntü · ${formatMMSS(totalAudioDuration)})`}
