@@ -104,7 +104,7 @@ export const TopBar: React.FC<TopBarProps> = ({
               <FileText
                 className={`h-3.5 w-3.5 ${isTranscribeActive ? 'text-[#D99B26]' : 'text-[#64748B]'}`}
               />
-              <span>Ses → Transkript</span>
+              <span>Transkript &amp; Plan</span>
             </button>
           </nav>
 
@@ -171,7 +171,7 @@ export const TopBar: React.FC<TopBarProps> = ({
             }`}
           >
             <FileText className={`h-3 w-3 shrink-0 ${isTranscribeActive ? 'text-[#D99B26]' : ''}`} />
-            <span className="truncate">Transkript</span>
+            <span className="truncate">Transkript &amp; Plan</span>
           </button>
         </nav>
       </div>

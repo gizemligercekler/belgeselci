@@ -759,6 +759,382 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
     }
   });
 
+  // 3. Generate Scene Timing Plan + Historically Accurate 16:9 2K Image Prompts via Gemini 4 Hydrogen
+  app.post('/api/generate-scene-plan', async (req: Request, res: Response) => {
+    try {
+      const apiKey = resolveGeminiKey(req);
+      if (!apiKey) {
+        res.status(401).json({
+          error:
+            'Gemini API anahtarı bulunamadı. Ayarlar penceresinden anahtar girin veya sunucu GEMINI_API_KEY değişkenini tanımlayın.',
+        });
+        return;
+      }
+
+      const {
+        windowSegments = [],
+        windowStartSec = 0,
+        windowEndSec = 0,
+        totalDurationSec = 0,
+        startOrderNumber = 1,
+        documentaryContext = '',
+        previousSceneSummary = '',
+        styleDirection = '',
+        targetSceneCount = 0,
+        maxSceneDurationSec = 60,
+        model = 'gemini-4-hydrogen',
+      } = req.body as {
+        windowSegments?: Array<{ startSec: number; endSec: number; text: string }>;
+        windowStartSec?: number;
+        windowEndSec?: number;
+        totalDurationSec?: number;
+        startOrderNumber?: number;
+        documentaryContext?: string;
+        previousSceneSummary?: string;
+        styleDirection?: string;
+        targetSceneCount?: number;
+        maxSceneDurationSec?: number;
+        model?: string;
+      };
+
+      if (!Array.isArray(windowSegments) || windowSegments.length === 0) {
+        res.status(400).json({ error: 'Sahne planı üretilecek transkript bölümü boş.' });
+        return;
+      }
+
+      const safeStart = Math.max(0, Number(windowStartSec) || 0);
+      const maxSegEnd = windowSegments.reduce((m, s) => Math.max(m, Number(s.endSec) || 0), 0);
+      const safeEnd = Math.max(safeStart + 2, Number(windowEndSec) || maxSegEnd);
+      const windowDur = safeEnd - safeStart;
+      const safeTotal = Math.max(safeEnd, Number(totalDurationSec) || safeEnd);
+      const firstNum = Math.max(1, Math.floor(Number(startOrderNumber) || 1));
+      const maxSec = Math.max(15, Math.min(180, Math.round(Number(maxSceneDurationSec) || 60)));
+
+      // Strictly guarantee enough scenes so NO scene needs to exceed maxSec
+      const minScenesForCap = Math.max(1, Math.ceil(windowDur / maxSec));
+      const autoMinScenes = Math.max(minScenesForCap, Math.round(windowDur / Math.min(42, maxSec * 0.7)));
+      const autoMaxScenes = Math.max(autoMinScenes + 2, Math.round(windowDur / 20));
+      const explicitTarget =
+        Number.isFinite(Number(targetSceneCount)) && Number(targetSceneCount) > 0
+          ? Math.max(minScenesForCap, Math.min(80, Math.round(Number(targetSceneCount))))
+          : 0;
+
+      const countInstruction =
+        explicitTarget > 0
+          ? `Bu bölüm (${Math.round(windowDur)} sn) için en az ${minScenesForCap}, yaklaşık ${explicitTarget} sahne oluştur. HİÇBİR sahne ${maxSec} saniyeyi geçmemelidir.`
+          : `Bu bölümün (${Math.round(windowDur)} sn) anlatım akışına ve konu değişimlerine göre ideal sahne sayısına karar ver (belgesel temposu için ideal sahne süresi 18–42 saniye arasıdır; bu bölüm için en az ${autoMinScenes}, ideal olarak ${autoMinScenes}–${autoMaxScenes} sahne üret ve HİÇBİR sahne ${maxSec} saniyeyi geçmesin).`;
+
+      const transcriptBlock = windowSegments
+        .map(
+          (s) =>
+            `[${formatMMSS(Number(s.startSec))} - ${formatMMSS(Number(s.endSec))}] (${Number(s.startSec).toFixed(1)}s) ${String(s.text || '').trim()}`
+        )
+        .join('\n');
+
+      const styleNote = styleDirection.trim()
+        ? `KULLANICININ ÖZEL GÖRSEL STİL TERCİHİ: ${styleDirection.trim()}`
+        : 'GÖRSEL STİL: Sinematik, gerçekçi, yüksek detaylı tarihi belgesel fotoğrafçılığı / film karesi estetiği (doğal dokular, atmosferik sinematografi, abartısız renk paleti).';
+
+      const sceneResponseSchema = {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            title: {
+              type: Type.STRING,
+              description: 'Short descriptive Turkish scene title suitable as an image filename.',
+            },
+            era: {
+              type: Type.STRING,
+              description: 'Historical century/decade and geography in Turkish (e.g. "7. Yüzyıl (600\'ler), Hicaz" or "1959, ABD").',
+            },
+            startSec: {
+              type: Type.NUMBER,
+              description: 'Exact start time in seconds within the window.',
+            },
+            endSec: {
+              type: Type.NUMBER,
+              description: 'Exact end time in seconds within the window.',
+            },
+            imagePrompt: {
+              type: Type.STRING,
+              description: 'Detailed English 16:9 2K historically accurate cinematic image generation prompt with zero anachronisms.',
+            },
+          },
+          required: ['title', 'era', 'startSec', 'endSec', 'imagePrompt'],
+        },
+      };
+
+      const systemInstruction = `Sen ödüllü bir belgesel yönetmeni, tarih danışmanı ve görsel prompt uzmanısın.
+Görevin, sana verilen zaman damgalı Türkçe belgesel transkriptinden, hem her sahnenin ekranda kalacağı kesin saniye aralığını hem de her sahne için 16:9 2K çözünürlükte, DÖNEMSEL OLARAK %100 TARİHİ DOĞRULUĞA SAHİP İngilizce görsel üretim promptlarını (imagePrompt) oluşturmaktır.
+
+TARİHSEL DÖNEM VE ANAKRONİZM YASAĞI (EN KRİTİK KURAL):
+- Her sahnenin geçtiği yüzyılı, on yılı ve coğrafyayı transkriptten tespit et ve "era" alanına Türkçe yaz (örn: "7. Yüzyıl (600'ler), Hicaz", "1959, Michigan ABD", "15. Yüzyıl, Osmanlı").
+- Seçilen dönemde HENÜZ İCAT EDİLMEMİŞ hiçbir nesne, kıyafet, aydınlatma veya mimari öğe prompt içinde ASLA geçmemelidir:
+  * 13. yüzyıl öncesi (örn. 600'lü yıllar / 7. yüzyıl, Antik Çağ, Erken Orta Çağ): ASLA gözlük (eyeglasses/spectacles ~1286'da icat edildi), ASLA camlı gaz lambası (kerosene/glass lamp 19. yy'da çıktı), ASLA matbaa baskı kitap, ASLA elektrik, modern düğme, fermuar, kol saati, asfalt, modern pencere camı bulunmamalıdır. Aydınlatma için yalnızca döneme uygun kil/bronz zeytinyağı kandili (clay/bronze oil lamp), balmumu mum, meşale, ocak ateşi veya doğal gün ışığı kullan; yazı malzemesi olarak parşömen/papirüs/deri rulo ve kamış kalem kullan.
+  * 1850 öncesi dönemler: Camlı gaz lambası, elektrik ampulü, fotoğraf makinesi, modern sanayi ürünleri yasaktır.
+  * 1900–1980 arası dönemler (örn. 1950'ler): Akıllı telefon, LED ekran, modern plastik, çağdaş kıyafetler yasaktır; yalnızca o on yılın gerçek mobilya, araç, giyim ve film dokusunu betimle.
+- Promptta hem döneme uygun özgün malzemeleri açıkça belirt hem de anakronizmleri engelleyen ifadeler kullan.
+
+İMAJ PROMPTU FORMAT KURALLARI:
+- "imagePrompt" alanı, modern görsel üretim araçlarında (Imagen, Midjourney, Flux, Whisk, Nano Banana) en yüksek kaliteyi vermesi için akıcı, betimleyici ve sinematik İNGİLİZCE yazılmalıdır.
+- Her promptta şu unsurlar net biçimde yer almalıdır: kamera açısı/kadraj, ana konu ve eylem, döneme tam uyumlu kıyafet/mimari/nesneler, döneme uygun doğal ışık ve atmosfer, renk/doku kalitesi.
+- Her prompt mutlaka "16:9 widescreen aspect ratio, 2K resolution, historically accurate period details, no anachronisms, no text, no watermark" ibarelerini (doğal bütünlük içinde) içermelidir.
+- Görsellerde asla metin, yazı, tabela, filigran, çerçeve veya kolaj bölünmesi isteme (tek bir tam çerçeve 16:9 sahne).
+- "title" alanı kısa, anlaşılır TÜRKÇE sahne başlığı olmalıdır (dosya adı olarak kullanılacak; örn: "Ypsilanti Akıl Hastanesi Koğuşu (1959)").
+
+ZAMANLAMA VE SÜRE ÜST SINIRI KURALLARI (KESİN):
+- İlk sahne KESİNLİKLE ${safeStart.toFixed(2)} saniyesinde başlamalıdır.
+- Son sahne KESİNLİKLE ${safeEnd.toFixed(2)} saniyesinde bitmelidir (aralığın tamamını dengeli biçimde kapla; son sahneyi uzatma!).
+- Sahneler arasında HİÇ boşluk veya çakışma olmamalıdır: her sahnenin startSec değeri bir önceki sahnenin endSec değerine eşit olmalıdır (kesintisiz akış).
+- KESİN ÜST SINIR: HİÇBİR sahne ${maxSec} saniyeden uzun OLMAMALIDIR (endSec - startSec <= ${maxSec})!
+- İdeal sahne süresi 18–42 saniye arasıdır (en az 5 saniye, en fazla ${maxSec} saniye).
+- Anlatıcı aynı konudan ${maxSec} saniyeden uzun bahsediyorsa, o bölümü mutlaka farklı görsel açılarla birden fazla sahneye böl (örn. 1. geniş mekan atmosferi -> 2. karakter/eylem orta planı -> 3. döneme özgü yakın detay çekimi). Tek bir görsel asla ${maxSec} saniyeden uzun ekranda kalmamalıdır.`;
+
+      const prompt = `BELGESEL GENEL BAĞLAMI (Toplam Süre: ${formatMMSS(safeTotal)}):
+${documentaryContext.trim() || '(Genel bağlam transkriptten anlaşılacaktır.)'}
+${previousSceneSummary.trim() ? `\nÖNCEKİ BÖLÜMÜN SON SAHNESİ (Görsel devamlılık için):\n${previousSceneSummary.trim()}\n` : ''}
+${styleNote}
+
+HEDEF ARALIK: ${formatMMSS(safeStart)} (${safeStart.toFixed(2)}s) – ${formatMMSS(safeEnd)} (${safeEnd.toFixed(2)}s)
+BAŞLANGIÇ SAHNE NUMARASI: ${firstNum}
+MAKSİMUM SAHNE SÜRESİ: ${maxSec} saniye (HİÇBİR SAHNE ${maxSec} SANİYEYİ GEÇMEMELİDİR!)
+${countInstruction}
+
+ZAMAN DAMGALI TRANSKRİPT BÖLÜMÜ:
+${transcriptBlock}
+
+Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için kesintisiz, her sahnesi en fazla ${maxSec} saniye süren, dönemsel olarak %100 tutarlı, 16:9 2K görsel promptlu sahne planını JSON dizisi olarak üret.`;
+
+      type RawSceneItem = {
+        title?: string;
+        era?: string;
+        startSec?: number;
+        endSec?: number;
+        imagePrompt?: string;
+      };
+
+      type NormalizedScene = {
+        title: string;
+        era: string;
+        startSec: number;
+        endSec: number;
+        durationSec: number;
+        imagePrompt: string;
+      };
+
+      const ensurePromptTags = (rawPrompt: string): string => {
+        let imgPrompt = String(rawPrompt || '').trim();
+        if (!/16:9/i.test(imgPrompt)) {
+          imgPrompt += ', 16:9 widescreen aspect ratio';
+        }
+        if (!/\b2k\b/i.test(imgPrompt)) {
+          imgPrompt += ', 2K resolution';
+        }
+        return imgPrompt;
+      };
+
+      const normalizeWindowScenes = (
+        items: RawSceneItem[],
+        winStart: number,
+        winEnd: number,
+        fallbackLabelStart: number
+      ): NormalizedScene[] => {
+        const n = items.length;
+        const dur = Math.max(0.5, winEnd - winStart);
+        const minStep = dur >= n * 2.5 ? 2.5 : Number((dur / n).toFixed(2));
+        const starts: number[] = new Array(n).fill(winStart);
+        starts[0] = Number(winStart.toFixed(2));
+
+        for (let i = 1; i < n; i++) {
+          const rawStart = Number(items[i].startSec);
+          const minAllowed = Number((starts[i - 1] + minStep).toFixed(2));
+          const maxAllowed = Number((winEnd - (n - i) * minStep).toFixed(2));
+          let candidate = Number.isFinite(rawStart)
+            ? rawStart
+            : Number((winStart + (i / n) * dur).toFixed(2));
+          if (candidate < minAllowed) candidate = minAllowed;
+          if (candidate > maxAllowed) candidate = maxAllowed;
+          starts[i] = Number(candidate.toFixed(2));
+        }
+
+        return items.map((item, idx) => {
+          const sSec = starts[idx];
+          const eSec = idx < n - 1 ? starts[idx + 1] : Number(winEnd.toFixed(2));
+          const durSec = Number(Math.max(0.5, eSec - sSec).toFixed(2));
+          return {
+            title:
+              String(item.title || '')
+                .replace(/^\d+\s*[.):\-]\s*/, '')
+                .trim() || `Sahne ${fallbackLabelStart + idx}`,
+            era: String(item.era || '').trim(),
+            startSec: sSec,
+            endSec: eSec,
+            durationSec: durSec,
+            imagePrompt: ensurePromptTags(item.imagePrompt || ''),
+          };
+        });
+      };
+
+      const parseJsonScenes = (text: string): RawSceneItem[] => {
+        const cleaned = (text || '[]')
+          .trim()
+          .replace(/^```(?:json)?\s*/i, '')
+          .replace(/```\s*$/i, '')
+          .trim();
+        const parsed = JSON.parse(cleaned) as RawSceneItem[];
+        return Array.isArray(parsed)
+          ? parsed.filter((item) => item && typeof item.imagePrompt === 'string' && item.imagePrompt.trim())
+          : [];
+      };
+
+      const ai = createGenAIClient(apiKey);
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: sceneResponseSchema,
+        },
+      });
+
+      const rawItems = parseJsonScenes(response.text ?? '[]');
+      if (rawItems.length === 0) {
+        res.status(500).json({
+          error: 'Hydrogen bu bölüm için sahne planı döndürmedi. Lütfen tekrar deneyin.',
+        });
+        return;
+      }
+
+      const initialScenes = normalizeWindowScenes(rawItems, safeStart, safeEnd, firstNum);
+
+      // Automatic split pass: if any scene STILL exceeds maxSec (e.g., > 60s), ask Hydrogen to break
+      // that exact stretch into multiple distinct visual angles (wide -> medium -> close-up detail)
+      // and apply a deterministic camera-angle split fallback if anything still exceeds maxSec.
+      const framingFallbacks = [
+        { suffix: ' (Geniş Plan)', prefix: 'Wide establishing cinematic view, ' },
+        { suffix: ' (Orta Plan)', prefix: 'Medium cinematic perspective focusing on subjects and period atmosphere, ' },
+        { suffix: ' (Yakın Detay)', prefix: 'Intimate close-up documentary detail shot highlighting authentic period textures and objects, ' },
+        { suffix: ' (Alternatif Açı)', prefix: 'Atmospheric low-angle cinematic documentary shot, ' },
+      ];
+
+      const enforceDeterministicCap = (sc: NormalizedScene): NormalizedScene[] => {
+        if (sc.durationSec <= maxSec + 0.5) return [sc];
+        const parts = Math.max(2, Math.ceil(sc.durationSec / maxSec));
+        const partDur = sc.durationSec / parts;
+        const out: NormalizedScene[] = [];
+        for (let p = 0; p < parts; p++) {
+          const pStart = p === 0 ? sc.startSec : Number((sc.startSec + p * partDur).toFixed(2));
+          const pEnd = p === parts - 1 ? sc.endSec : Number((sc.startSec + (p + 1) * partDur).toFixed(2));
+          const fb = framingFallbacks[p % framingFallbacks.length];
+          out.push({
+            title: `${sc.title}${fb.suffix}`,
+            era: sc.era,
+            startSec: pStart,
+            endSec: pEnd,
+            durationSec: Number(Math.max(0.5, pEnd - pStart).toFixed(2)),
+            imagePrompt: ensurePromptTags(p === 0 ? sc.imagePrompt : `${fb.prefix}${sc.imagePrompt}`),
+          });
+        }
+        return out;
+      };
+
+      const refinedScenes: NormalizedScene[] = [];
+      let splitApiCallsUsed = 0;
+      const MAX_SPLIT_CALLS_PER_BLOCK = 5;
+
+      for (const sc of initialScenes) {
+        if (sc.durationSec <= maxSec + 0.5) {
+          refinedScenes.push(sc);
+          continue;
+        }
+
+        const targetParts = Math.max(2, Math.ceil(sc.durationSec / Math.min(36, maxSec - 10)));
+        if (splitApiCallsUsed < MAX_SPLIT_CALLS_PER_BLOCK) {
+          splitApiCallsUsed++;
+          try {
+            const subSegs = windowSegments.filter(
+              (seg) => Number(seg.endSec) > sc.startSec + 0.05 && Number(seg.startSec) < sc.endSec
+            );
+            const subTranscript =
+              subSegs.length > 0
+                ? subSegs
+                    .map(
+                      (s) =>
+                        `[${formatMMSS(Number(s.startSec))} - ${formatMMSS(Number(s.endSec))}] (${Number(s.startSec).toFixed(1)}s) ${String(s.text || '').trim()}`
+                    )
+                    .join('\n')
+                : `[${formatMMSS(sc.startSec)} - ${formatMMSS(sc.endSec)}] (${sc.startSec.toFixed(1)}s) ${sc.title}`;
+
+            const splitPrompt = `Aşağıdaki belgesel sahnesi ${Math.round(sc.durationSec)} saniye sürdüğü için ${maxSec} saniyelik üst sınırı aşıyor.
+Görevin: Bu aralığı (${sc.startSec.toFixed(2)}s – ${sc.endSec.toFixed(2)}s) tam olarak ${targetParts} adet FARKLI ve kesintisiz alt sahneye bölmek!
+
+MEVCUT SAHNE: "${sc.title}" (Dönem: ${sc.era || 'Belgesel dönemi'})
+${styleNote}
+
+KURALLAR:
+- Tam olarak ${targetParts} sahne üret; her biri en fazla ${maxSec} saniye (ideal ~${Math.round(sc.durationSec / targetParts)} sn) olsun.
+- İlk alt sahne ${sc.startSec.toFixed(2)}s'de başlasın, son alt sahne ${sc.endSec.toFixed(2)}s'de bitsin.
+- Her alt sahnede FARKLI bir kamera açısı, kadraj ve görsel odak kullan (örn. 1. geniş ortam planı, 2. karakter/eylem orta planı, 3. yakın dönem detayı / nesne / mimari).
+- Dönemsel doğruluğu ve anakronizm yasağını %100 koru, her prompt 16:9 2K İngilizce olsun.
+
+BU ARALIĞIN TRANSKRİPTİ:
+${subTranscript}`;
+
+            const splitRes = await ai.models.generateContent({
+              model,
+              contents: splitPrompt,
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema: sceneResponseSchema,
+              },
+            });
+
+            const splitRaw = parseJsonScenes(splitRes.text ?? '[]');
+            if (splitRaw.length >= 2) {
+              const splitNormalized = normalizeWindowScenes(splitRaw, sc.startSec, sc.endSec, firstNum);
+              for (const sub of splitNormalized) {
+                refinedScenes.push(...enforceDeterministicCap(sub));
+              }
+              continue;
+            }
+          } catch (splitErr) {
+            console.warn(
+              '[/api/generate-scene-plan] oversized scene split fallback used:',
+              splitErr instanceof Error ? splitErr.message : splitErr
+            );
+          }
+        }
+
+        // Deterministic fallback if split API call failed or budget reached
+        refinedScenes.push(...enforceDeterministicCap(sc));
+      }
+
+      const scenes = refinedScenes.map((sc, idx) => ({
+        orderNumber: firstNum + idx,
+        title: sc.title,
+        era: sc.era,
+        startSec: sc.startSec,
+        endSec: sc.endSec,
+        durationSec: sc.durationSec,
+        imagePrompt: sc.imagePrompt,
+      }));
+
+      res.json({ scenes, modelUsed: model });
+    } catch (err) {
+      const parsedErr = parseErrorStatus(err);
+      console.error('[/api/generate-scene-plan] error:', parsedErr.upstreamStatus, parsedErr.code, parsedErr.message);
+      res.status(parsedErr.httpStatus).json({
+        error: parsedErr.message,
+        code: parsedErr.code,
+        upstreamStatus: parsedErr.upstreamStatus,
+        retryable: parsedErr.retryable,
+      });
+    }
+  });
+
   // Always return JSON for /api middleware errors (e.g. PayloadTooLargeError / invalid JSON)
   app.use(
     '/api',

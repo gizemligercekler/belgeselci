@@ -1,4 +1,9 @@
-import { TimingPlanEntry, TranscriptSegment, UploadedImage } from '../types/editor';
+import {
+  GeneratedScenePlanItem,
+  TimingPlanEntry,
+  TranscriptSegment,
+  UploadedImage,
+} from '../types/editor';
 
 const NATURAL_COLLATOR = new Intl.Collator('tr', { numeric: true, sensitivity: 'base' });
 
@@ -380,6 +385,8 @@ const TIME_RANGE_RE =
   /(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)\s*(?:-->|->|[-–—])\s*(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)/;
 const CLOCK_START_RE = /^\d{1,2}:\d{2}/;
 const TIMING_LABEL_RE = /^(?:zaman|süre|sure|aralık|aralik|time|duration)\s*:/i;
+const IGNORED_META_LINE_RE =
+  /^(?:prompt|g[öo]rsel\s*promptu?|image\s*prompt|d[öo]nem|era|stil|style|not|note|a[çc][ıi]klama)\s*:/i;
 const NUMBERED_HEADING_RE =
   /^(?:(?:sahne|görsel|gorsel|resim|klip|kare)\s*#?\s*)?(\d+)\s*[.):\-]\s*(.+)$/i;
 
@@ -387,6 +394,8 @@ const NUMBERED_HEADING_RE =
  * Parses a Turkish scene timing plan .txt file such as:
  *   1. Ypsilanti Akıl Hastanesi Koğuşu (1959)
  *   Zaman: 00:00:00 - 00:00:17 (17 saniye)
+ *   Dönem: 1959, Michigan ABD
+ *   Prompt: ...
  *
  * Also handles single-line entries, MM:SS or HH:MM:SS ranges, markdown bold (**1. ...**),
  * and duration-only lines ("Süre: 17 saniye").
@@ -435,6 +444,10 @@ export function parseTimingPlanTxt(txtContent: string): TimingPlanEntry[] {
   };
 
   for (const line of rawLines) {
+    if (IGNORED_META_LINE_RE.test(line)) {
+      continue;
+    }
+
     const rangeMatch = line.match(TIME_RANGE_RE);
     const explicitDur = parseExplicitDurationSec(line);
     const isTimingLabelLine = TIMING_LABEL_RE.test(line);
@@ -514,4 +527,42 @@ export function parseTimingPlanTxt(txtContent: string): TimingPlanEntry[] {
   }
 
   return entries.sort((a, b) => a.orderNumber - b.orderNumber || a.startSec - b.startSec);
+}
+
+export function formatHHMMSS(sec: number): string {
+  const clamped = Math.max(0, Math.round(sec));
+  const h = Math.floor(clamped / 3600);
+  const m = Math.floor((clamped % 3600) / 60);
+  const s = clamped % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+/**
+ * Formats generated Hydrogen scenes into a single unified .txt file containing
+ * exact scene timestamps (100% compatible with Step 1 .TXT upload) + 16:9 2K image prompts.
+ */
+export function scenePlanToUnifiedTxt(items: GeneratedScenePlanItem[]): string {
+  return items
+    .map((item) => {
+      const durRounded = Math.max(1, Math.round(item.durationSec));
+      const lines = [
+        `${item.orderNumber}. ${item.title}`,
+        `Zaman: ${formatHHMMSS(item.startSec)} - ${formatHHMMSS(item.endSec)} (${durRounded} saniye)`,
+      ];
+      if (item.era?.trim()) {
+        lines.push(`Dönem: ${item.era.trim()}`);
+      }
+      lines.push(`Prompt: ${item.imagePrompt.trim()}`);
+      return lines.join('\n');
+    })
+    .join('\n\n');
+}
+
+/**
+ * Formats only numbered image prompts for batch image generation tools.
+ */
+export function scenePlanToPromptsOnlyTxt(items: GeneratedScenePlanItem[]): string {
+  return items
+    .map((item) => `${item.orderNumber}. ${item.imagePrompt.trim()}`)
+    .join('\n\n');
 }

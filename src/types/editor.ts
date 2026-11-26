@@ -24,6 +24,11 @@ export interface TimingPlanEntry {
   durationSec: number;
 }
 
+export interface GeneratedScenePlanItem extends TimingPlanEntry {
+  era: string;
+  imagePrompt: string;
+}
+
 export interface TimelineScene {
   id: string;
   orderNumber: number;

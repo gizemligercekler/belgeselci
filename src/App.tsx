@@ -3,6 +3,7 @@ import {
   DEFAULT_EDITOR_SETTINGS,
   DEFAULT_ZOOM_SPEED_PER_SEC,
   EditorSettings,
+  GeneratedScenePlanItem,
   PersistedSession,
   TimelineScene,
   TimingPlanEntry,
@@ -560,10 +561,16 @@ export default function App() {
     extractedSegments: TranscriptSegment[],
     sourceSrtName: string,
     sourceAudioFile: File | null,
-    durationSec: number
+    durationSec: number,
+    generatedPlan?: GeneratedScenePlanItem[],
+    planFileName?: string
   ) => {
     setSrtFileName(sourceSrtName);
     setSrtSegments(extractedSegments);
+    if (generatedPlan && generatedPlan.length > 0) {
+      setTimingPlanEntries(generatedPlan);
+      setTimingPlanFileName(planFileName || 'sahne_plani_ve_promptlar.txt');
+    }
     if (sourceAudioFile) {
       void handleSelectAudio(sourceAudioFile);
     } else if (durationSec > 0) {

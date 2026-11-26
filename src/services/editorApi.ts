@@ -1,5 +1,6 @@
 import {
   EditorSettings,
+  GeneratedScenePlanItem,
   TimelineScene,
   TimingPlanEntry,
   TranscriptSegment,
@@ -473,5 +474,210 @@ export async function alignImagesWithTranscript(
   return {
     scenes,
     modelUsed: data.modelUsed || modelChain[usedModelIndex] || 'gemini-4-hydrogen',
+  };
+}
+
+export interface ScenePlanProgress {
+  currentBlock: number;
+  totalBlocks: number;
+  generatedCount: number;
+  message: string;
+}
+
+const SCENE_PLAN_SINGLE_CALL_MAX_SEC = 720; // <= 12 minutes -> 1 single Hydrogen call
+const SCENE_PLAN_BLOCK_SEC = 600; // 10-minute narrative blocks for longer documentaries
+const SCENE_PLAN_INTER_BLOCK_DELAY_MS = 1500;
+
+/**
+ * Generates a full documentary scene timing plan + historically accurate 16:9 2K image prompts
+ * using Gemini 4 Hydrogen (Free Tier), automatically splitting long transcripts into 10-minute
+ * narrative blocks so ~100+ scene documentaries never truncate or lose timeline sync.
+ */
+export async function generateScenePlanWithHydrogen(
+  transcriptSegments: TranscriptSegment[],
+  totalDurationSec: number,
+  settings: EditorSettings,
+  options?: ApiCallOptions & {
+    styleDirection?: string;
+    targetTotalScenes?: number; // 0 = auto (Hydrogen decides based on transcript)
+    maxSceneDurationSec?: number; // default 60s hard ceiling per image
+    onProgress?: (progress: ScenePlanProgress) => void;
+    onPartialScenes?: (scenes: GeneratedScenePlanItem[]) => void;
+  }
+): Promise<{ scenes: GeneratedScenePlanItem[]; modelUsed: string }> {
+  if (transcriptSegments.length === 0) {
+    throw new Error('Sahne planı oluşturmak için önce transkript çıkarılmalı veya .SRT yüklenmelidir.');
+  }
+
+  const maxSec = Math.max(15, Math.min(180, Math.round(options?.maxSceneDurationSec ?? 60)));
+  const maxSegEnd = transcriptSegments.reduce((m, s) => Math.max(m, s.endSec), 0);
+  const effectiveTotal = round2(Math.max(2, totalDurationSec || maxSegEnd));
+
+  // Build chronological time windows covering [0 .. effectiveTotal]
+  const windows: Array<{ startSec: number; endSec: number }> = [];
+  if (effectiveTotal <= SCENE_PLAN_SINGLE_CALL_MAX_SEC) {
+    windows.push({ startSec: 0, endSec: effectiveTotal });
+  } else {
+    let cursor = 0;
+    while (cursor < effectiveTotal - 1) {
+      const remaining = effectiveTotal - cursor;
+      // Avoid tiny trailing tail (< 3 min): merge into current window
+      const nextEnd =
+        remaining <= SCENE_PLAN_BLOCK_SEC + 180
+          ? effectiveTotal
+          : round2(cursor + SCENE_PLAN_BLOCK_SEC);
+      windows.push({ startSec: round2(cursor), endSec: nextEnd });
+      cursor = nextEnd;
+    }
+  }
+
+  // Extract overall documentary context (opening ~20 lines + mid + late sample) for era consistency
+  const openingSnippet = transcriptSegments
+    .slice(0, 18)
+    .map((s) => s.text)
+    .join(' ')
+    .slice(0, 900);
+  const midIdx = Math.floor(transcriptSegments.length / 2);
+  const midSnippet =
+    transcriptSegments.length > 25
+      ? transcriptSegments
+          .slice(midIdx, midIdx + 8)
+          .map((s) => s.text)
+          .join(' ')
+          .slice(0, 450)
+      : '';
+  const documentaryContext = midSnippet
+    ? `Açılış özeti: ${openingSnippet}\nOrta bölüm örneği: ${midSnippet}`
+    : openingSnippet;
+
+  // Always prioritize gemini-4-hydrogen (Free Tier) first
+  const modelChain = buildAlignmentModelChain('gemini-4-hydrogen');
+  const allScenes: GeneratedScenePlanItem[] = [];
+  let lastModelUsed = 'gemini-4-hydrogen';
+  let currentModelIdx = 0;
+
+  for (let bIdx = 0; bIdx < windows.length; bIdx++) {
+    if (options?.signal?.aborted) {
+      throw new DOMException('Sahne planı oluşturma iptal edildi.', 'AbortError');
+    }
+
+    const win = windows[bIdx];
+    const windowSegments = transcriptSegments.filter(
+      (seg) => seg.endSec > win.startSec + 0.05 && seg.startSec < win.endSec
+    );
+    const effectiveWindowSegs =
+      windowSegments.length > 0
+        ? windowSegments
+        : [
+            {
+              startSec: win.startSec,
+              endSec: win.endSec,
+              text: '(Bu aralıkta anlatıcı sessiz veya müzik/geçiş bölümü.)',
+            },
+          ];
+
+    const windowDur = win.endSec - win.startSec;
+    const targetForBlock =
+      options?.targetTotalScenes && options.targetTotalScenes > 0
+        ? Math.max(1, Math.round((options.targetTotalScenes * windowDur) / effectiveTotal))
+        : 0;
+
+    const prevScene = allScenes[allScenes.length - 1];
+    const previousSceneSummary = prevScene
+      ? `#${prevScene.orderNumber} "${prevScene.title}" (Dönem: ${prevScene.era}) — ${prevScene.endSec.toFixed(1)}s'de bitti.`
+      : '';
+
+    options?.onProgress?.({
+      currentBlock: bIdx + 1,
+      totalBlocks: windows.length,
+      generatedCount: allScenes.length,
+      message:
+        windows.length === 1
+          ? `Gemini 4 Hydrogen ile sahne planı (maks. ${maxSec} sn) ve 16:9 2K promptlar yazılıyor...`
+          : `Gemini 4 Hydrogen ile sahne planı (maks. ${maxSec} sn): Bölüm ${bIdx + 1}/${windows.length}...`,
+    });
+
+    const startOrderNumber = allScenes.length + 1;
+
+    const { data, usedModelIndex } = await sendWithModelFailover<{
+      scenes: GeneratedScenePlanItem[];
+      modelUsed?: string;
+    }>(
+      '/api/generate-scene-plan',
+      modelChain,
+      currentModelIdx,
+      (modelName) => {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (settings.customApiKey.trim()) {
+          headers['x-gemini-api-key'] = settings.customApiKey.trim();
+        }
+        return {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            windowSegments: effectiveWindowSegs,
+            windowStartSec: win.startSec,
+            windowEndSec: win.endSec,
+            totalDurationSec: effectiveTotal,
+            startOrderNumber,
+            documentaryContext,
+            previousSceneSummary,
+            styleDirection: options?.styleDirection || '',
+            targetSceneCount: targetForBlock,
+            maxSceneDurationSec: maxSec,
+            model: modelName,
+          }),
+        };
+      },
+      `Sahne planı Bölüm ${bIdx + 1}/${windows.length}`,
+      options
+    );
+
+    currentModelIdx = usedModelIndex;
+    lastModelUsed = data.modelUsed || modelChain[usedModelIndex] || 'gemini-4-hydrogen';
+
+    const blockScenes = Array.isArray(data.scenes) ? data.scenes : [];
+    for (const sc of blockScenes) {
+      allScenes.push({
+        orderNumber: allScenes.length + 1,
+        title: String(sc.title || `Sahne ${allScenes.length + 1}`).trim(),
+        era: String(sc.era || '').trim(),
+        startSec: round2(Number(sc.startSec) || win.startSec),
+        endSec: round2(Number(sc.endSec) || win.endSec),
+        durationSec: round2(Math.max(0.5, (Number(sc.endSec) || win.endSec) - (Number(sc.startSec) || win.startSec))),
+        imagePrompt: String(sc.imagePrompt || '').trim(),
+      });
+    }
+
+    options?.onPartialScenes?.([...allScenes]);
+
+    if (bIdx < windows.length - 1) {
+      await sleepWithAbort(SCENE_PLAN_INTER_BLOCK_DELAY_MS, options?.signal);
+    }
+  }
+
+  // Final zero-gap contiguous normalization across entire documentary [0 .. effectiveTotal]
+  const normalized: GeneratedScenePlanItem[] = allScenes.map((sc, idx) => {
+    const startSec = idx === 0 ? 0 : round2(allScenes[idx - 1].endSec);
+    const endSec =
+      idx === allScenes.length - 1
+        ? effectiveTotal
+        : round2(Math.max(startSec + 1, sc.endSec));
+    sc.startSec = startSec;
+    sc.endSec = endSec;
+    return {
+      ...sc,
+      orderNumber: idx + 1,
+      startSec,
+      endSec,
+      durationSec: round2(Math.max(0.5, endSec - startSec)),
+    };
+  });
+
+  return {
+    scenes: normalized,
+    modelUsed: lastModelUsed,
   };
 }
