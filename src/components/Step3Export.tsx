@@ -253,25 +253,36 @@ export const Step3Export: React.FC<Step3ExportProps> = ({
           </div>
         )}
 
-        {/* Optional Local Audio Filename Input (helpful when user uploaded SRT without audio) */}
+        {/* Optional Local Audio Filename Input (helpful when user uploaded SRT/TXT or wants silent video-only render) */}
         <div className="mt-5 flex flex-col justify-between gap-3 rounded-md border border-white/[0.07] bg-[#0B0F17]/70 px-4 py-3 sm:flex-row sm:items-center">
           <div className="min-w-0">
             <label htmlFor="export-audio-filename" className="block text-xs font-medium text-[#E2E8F0]">
               Medya Klasöründeki Ses Dosyası Adı <span className="font-normal text-[#64748B]">(İsteğe bağlı)</span>
             </label>
             <p className="mt-0.5 text-[11px] text-[#94A3B8]">
-              Sadece .SRT yüklediyseniz bilgisayarınızdaki ses dosyasının adını buraya yazabilirsiniz (örn.{' '}
-              <span className="font-mono text-[#CBD5E1]">belgesel.mp3</span>). Boş bırakırsanız sessiz 16:9 1080p video üretilir.
+              Boş bırakırsanız veya klasörde ses dosyası yoksa <span className="font-mono text-[#CBD5E1]">render.py</span> hata vermez;
+              otomatik olarak sessiz 16:9 1080p video (<span className="font-mono text-[#CBD5E1]">belgesel_1080p.mp4</span>) üretir.
             </p>
           </div>
-          <input
-            id="export-audio-filename"
-            type="text"
-            value={audioFileName}
-            onChange={(e) => onChangeAudioFileName(e.target.value)}
-            placeholder="örn. belgesel.mp3 (isteğe bağlı)"
-            className="w-full shrink-0 rounded-md border border-white/[0.1] bg-[#131924] px-3 py-1.5 font-mono text-xs text-[#F1F5F9] placeholder-[#475569] focus:border-[#D99B26]/60 focus:outline-none sm:w-64"
-          />
+          <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto">
+            <input
+              id="export-audio-filename"
+              type="text"
+              value={audioFileName}
+              onChange={(e) => onChangeAudioFileName(e.target.value)}
+              placeholder="Sessiz render için boş bırakın"
+              className="w-full rounded-md border border-white/[0.1] bg-[#131924] px-3 py-1.5 font-mono text-xs text-[#F1F5F9] placeholder-[#475569] focus:border-[#D99B26]/60 focus:outline-none sm:w-56"
+            />
+            {audioFileName.trim() && (
+              <button
+                type="button"
+                onClick={() => onChangeAudioFileName('')}
+                className="shrink-0 rounded-md border border-white/[0.1] bg-[#131924] px-2.5 py-1.5 text-xs text-[#94A3B8] transition-colors hover:border-white/[0.2] hover:text-[#F1F5F9]"
+              >
+                Sessiz Yap
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="mt-6 flex flex-col items-start justify-between gap-5 lg:flex-row lg:items-center">

@@ -347,7 +347,8 @@ def main() -> None:
     with timeline_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    audio_name = (data.get("audioFile") or "").strip()
+    no_audio_flag = "--no-audio" in sys.argv[1:]
+    audio_name = "" if no_audio_flag else (data.get("audioFile") or "").strip()
     audio_path = (base_dir / audio_name) if audio_name else None
     scenes = data["scenes"]
     fps = int(data.get("fps", 30))
@@ -361,9 +362,13 @@ def main() -> None:
         print("HATA: timeline.json icinde hic sahne yok.")
         sys.exit(1)
 
-    missing = []
+    audio_missing_notice = None
     if audio_path is not None and not audio_path.exists():
-        missing.append(f"Ses dosyasi: {audio_name}")
+        audio_missing_notice = audio_name
+        audio_path = None
+        audio_name = ""
+
+    missing = []
     if burn_subtitles and not subtitle_path.exists():
         missing.append(f"Altyazi dosyasi: {subtitle_name}")
     for sc in scenes:
@@ -383,10 +388,15 @@ def main() -> None:
     total_dur = float(data.get("totalAudioDuration", sum(s["durationSec"] for s in scenes)))
     print("=" * 64)
     print("Belgesel Kurgu Asistani — 16:9 1080p Render Baslatiliyor")
+    if audio_missing_notice:
+        print(
+            f"Bilgi       : '{audio_missing_notice}' klasorde bulunamadi -> "
+            f"Ses olmadan 16:9 1080p goruntu uretilecek."
+        )
     if audio_name:
         print(f"Ses Dosyasi : {audio_name} ({fmt_time(total_dur)}) [Dokunulmadan -c:a copy]")
     else:
-        print(f"Ses Dosyasi : Yok (Yalnizca 16:9 1080p goruntu · {fmt_time(total_dur)})")
+        print(f"Ses Dosyasi : Yok (Sessiz 16:9 1080p goruntu · {fmt_time(total_dur)})")
     print(f"Gorsel Sayisi: {total_scenes} adet")
     print(f"Zoom Hizi   : %{zoom_speed * 100:.2f}/sn (Sabit Hiz, L_i = D_i + {dissolve_sec:.1f}s)")
     print(f"Cozunurluk  : 1920x1080 @ {fps}fps | Dissolve: {dissolve_sec:.1f} sn")
@@ -471,7 +481,7 @@ def main() -> None:
 
         if audio_path is None:
             final_output = base_dir / "belgesel_1080p.mp4"
-            print("\\nSes dosyasi belirtilmedigi icin yalnizca 16:9 1080p goruntu kaydediliyor...")
+            print("\\nSes dosyasi olmadan yalnizca 16:9 1080p goruntu kaydediliyor...")
             mux_cmd = [
                 ffmpeg_bin,
                 "-y",
@@ -595,7 +605,7 @@ Bu paket, **Belgesel Kurgu Asistanı** ile hazırladığınız zaman çizelgesin
    \`\`\`bash
    python render.py
    \`\`\`
-   *(macOS veya Linux'ta gerekirse \`python3 render.py\`)*
+   *(macOS veya Linux'ta gerekirse \`python3 render.py\`. Klasörde ses dosyası yoksa veya \`python render.py --no-audio\` yazarsanız hata vermeden otomatik olarak sessiz 16:9 1080p \`belgesel_1080p.mp4\` üretir.)*
 
 ## Wondershare Filmora'ya Aktarma
 İşlem bittiğinde klasörde oluşan **\`${outName}\`** dosyasını doğrudan Wondershare Filmora'ya sürükleyip bırakın. Görüntü 16:9 1080p, geçişler pürüzsüz ve orijinal belgesel sesiniz tek bir bit bile değişmeden hazır olacaktır.
