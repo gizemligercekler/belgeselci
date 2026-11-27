@@ -417,8 +417,8 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
           </h1>
           <p className="max-w-2xl text-sm text-[#94A3B8]">
             Belgesel sesinden zaman damgalı transkript çıkarın, ardından{' '}
-            <span className="text-[#CBD5E1]">Gemini 4 Hydrogen</span> ile dönemsel uyumlu{' '}
-            <span className="font-mono text-[#CBD5E1]">16:9 2K</span> görsel promptlarını ve saniye bazlı sahne planını tek{' '}
+            <span className="text-[#CBD5E1]">Gemini 4 Hydrogen</span> ile Nano Banana / Gemini uyumlu tam kare
+            belgesel fotoğraf promptlarını ve saniye bazlı sahne planını tek{' '}
             <span className="font-mono text-[#CBD5E1]">.TXT</span> dosyasında üretin.
           </p>
         </div>
@@ -665,16 +665,16 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-sm font-medium text-[#F1F5F9]">
                 <Clapperboard className="h-4 w-4 text-[#D99B26]" />
-                <span>2. Sahne Planı &amp; 16:9 2K Promptlar</span>
+                <span>2. Sahne Planı &amp; Görsel Promptlar</span>
               </div>
-              <span className="font-mono text-[11px] text-[#64748B]">Hydrogen Free</span>
+              <span className="font-mono text-[11px] text-[#64748B]">Nano Banana · Free</span>
             </div>
 
             <p className="text-xs leading-relaxed text-[#94A3B8]">
               Transkripti <span className="font-mono text-[#CBD5E1]">gemini-4-hydrogen</span>&apos;e göndererek
-              her sahnenin ekranda kalacağı kesin saniyeleri ve dönemsel olarak anakronizmsiz (örn. 600&apos;lerde
-              gözlük/gaz lambası olmadan) <span className="font-mono text-[#CBD5E1]">16:9 2K</span> görsel
-              promptlarını tek dosyada üretir.
+              siyah şeritsiz, yalnızca pozitif tarihsel betimlemeli tam kare (
+              <span className="font-mono text-[#CBD5E1]">full-frame</span>) belgesel fotoğraf promptlarını ve
+              sahne sürelerini tek dosyada üretir.
             </p>
 
             {/* Compact Optional Controls */}
@@ -710,6 +710,8 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
                     onChange={(e) => setMaxSceneSec(Number(e.target.value))}
                     className="w-full rounded-md border border-white/[0.1] bg-[#0B0F17] px-2.5 py-2 text-xs text-[#F1F5F9] focus:border-[#D99B26]/60 focus:outline-none disabled:opacity-50"
                   >
+                    <option value={20}>Maks. 20 saniye</option>
+                    <option value={30}>Maks. 30 saniye</option>
                     <option value={45}>Maks. 45 saniye</option>
                     <option value={60}>Maks. 60 saniye (Önerilen)</option>
                     <option value={90}>Maks. 90 saniye</option>
@@ -727,7 +729,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
                   disabled={busy}
                   value={styleDirection}
                   onChange={(e) => setStyleDirection(e.target.value)}
-                  placeholder="Varsayılan: Sinematik tarihi belgesel"
+                  placeholder="Varsayılan: Tarihsel belgesel fotoğrafçılığı"
                   className="w-full rounded-md border border-white/[0.1] bg-[#0B0F17] px-2.5 py-2 text-xs text-[#F1F5F9] placeholder-[#475569] focus:border-[#D99B26]/60 focus:outline-none disabled:opacity-50"
                 />
               </div>
@@ -773,7 +775,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
 
                 {scenePlan.length > 0 && (
                   <p className="font-mono text-[11px] tabular-nums text-[#64748B]">
-                    Şu ana kadar {scenePlan.length} sahne ve 16:9 2K prompt oluşturuldu...
+                    Şu ana kadar {scenePlan.length} sahne ve belgesel fotoğraf promptu oluşturuldu...
                   </p>
                 )}
               </div>
@@ -841,7 +843,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
             )}
             {activeRightTab === 'plan' && scenePlan.length > 0 && (
               <p className="font-mono text-xs tabular-nums text-[#64748B]">
-                {scenePlan.length} sahne · ort. {planDurationStats.avgSec} sn · maks. {planDurationStats.maxSec} sn · 16:9 2K
+                {scenePlan.length} sahne · ort. {planDurationStats.avgSec} sn · maks. {planDurationStats.maxSec} sn · full-frame
               </p>
             )}
           </div>
@@ -860,7 +862,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
                   <p className="mt-1.5 max-w-md text-xs leading-relaxed text-[#64748B]">
                     Sol taraftan ses dosyası yükleyip <span className="text-[#CBD5E1]">Transkript Çıkar</span>{' '}
                     düğmesine basın (veya mevcut <span className="font-mono text-[#CBD5E1]">.SRT</span> dosyanızı yükleyin).
-                    Ardından tek tıkla Hydrogen&apos;e sahne süre planını ve 16:9 2K görsel promptlarını yazdırabilirsiniz.
+                    Ardından tek tıkla Hydrogen&apos;e sahne süre planını ve Nano Banana uyumlu belgesel fotoğraf promptlarını yazdırabilirsiniz.
                   </p>
                 </div>
               ) : (
@@ -1025,7 +1027,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
                   <h2 className="text-sm font-medium text-[#E2E8F0]">
                     {isGeneratingPlan
                       ? planProgress?.message || 'Hydrogen sahne planını yazıyor...'
-                      : 'Sahne planı ve 16:9 2K promptlar burada görünecek'}
+                      : 'Sahne planı ve belgesel fotoğraf promptları burada görünecek'}
                   </h2>
                   <p className="mt-1.5 max-w-md text-xs leading-relaxed text-[#64748B]">
                     {isGeneratingPlan

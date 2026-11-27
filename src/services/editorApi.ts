@@ -513,19 +513,23 @@ export async function generateScenePlanWithHydrogen(
   const maxSegEnd = transcriptSegments.reduce((m, s) => Math.max(m, s.endSec), 0);
   const effectiveTotal = round2(Math.max(2, totalDurationSec || maxSegEnd));
 
+  // Adapt block window size for faster visual pacing (20s/30s caps generate more scenes per minute)
+  const blockSec = maxSec <= 25 ? 300 : maxSec <= 35 ? 420 : SCENE_PLAN_BLOCK_SEC;
+  const singleCallMaxSec = maxSec <= 25 ? 360 : maxSec <= 35 ? 480 : SCENE_PLAN_SINGLE_CALL_MAX_SEC;
+  const mergeTailSec = Math.round(blockSec * 0.3);
+
   // Build chronological time windows covering [0 .. effectiveTotal]
   const windows: Array<{ startSec: number; endSec: number }> = [];
-  if (effectiveTotal <= SCENE_PLAN_SINGLE_CALL_MAX_SEC) {
+  if (effectiveTotal <= singleCallMaxSec) {
     windows.push({ startSec: 0, endSec: effectiveTotal });
   } else {
     let cursor = 0;
     while (cursor < effectiveTotal - 1) {
       const remaining = effectiveTotal - cursor;
-      // Avoid tiny trailing tail (< 3 min): merge into current window
       const nextEnd =
-        remaining <= SCENE_PLAN_BLOCK_SEC + 180
+        remaining <= blockSec + mergeTailSec
           ? effectiveTotal
-          : round2(cursor + SCENE_PLAN_BLOCK_SEC);
+          : round2(cursor + blockSec);
       windows.push({ startSec: round2(cursor), endSec: nextEnd });
       cursor = nextEnd;
     }
@@ -593,7 +597,7 @@ export async function generateScenePlanWithHydrogen(
       generatedCount: allScenes.length,
       message:
         windows.length === 1
-          ? `Gemini 4 Hydrogen ile sahne planı (maks. ${maxSec} sn) ve 16:9 2K promptlar yazılıyor...`
+          ? `Gemini 4 Hydrogen ile sahne planı (maks. ${maxSec} sn) ve belgesel fotoğraf promptları yazılıyor...`
           : `Gemini 4 Hydrogen ile sahne planı (maks. ${maxSec} sn): Bölüm ${bIdx + 1}/${windows.length}...`,
     });
 

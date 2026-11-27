@@ -812,8 +812,10 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
 
       // Strictly guarantee enough scenes so NO scene needs to exceed maxSec
       const minScenesForCap = Math.max(1, Math.ceil(windowDur / maxSec));
-      const autoMinScenes = Math.max(minScenesForCap, Math.round(windowDur / Math.min(42, maxSec * 0.7)));
-      const autoMaxScenes = Math.max(autoMinScenes + 2, Math.round(windowDur / 20));
+      const idealMinSec = Math.min(18, Math.max(6, Math.round(maxSec * 0.45)));
+      const idealMaxSec = Math.max(idealMinSec + 4, Math.min(42, Math.round(maxSec * 0.85)));
+      const autoMinScenes = Math.max(minScenesForCap, Math.ceil(windowDur / idealMaxSec));
+      const autoMaxScenes = Math.max(autoMinScenes + 2, Math.round(windowDur / Math.max(8, idealMinSec)));
       const explicitTarget =
         Number.isFinite(Number(targetSceneCount)) && Number(targetSceneCount) > 0
           ? Math.max(minScenesForCap, Math.min(80, Math.round(Number(targetSceneCount))))
@@ -822,7 +824,7 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
       const countInstruction =
         explicitTarget > 0
           ? `Bu bölüm (${Math.round(windowDur)} sn) için en az ${minScenesForCap}, yaklaşık ${explicitTarget} sahne oluştur. HİÇBİR sahne ${maxSec} saniyeyi geçmemelidir.`
-          : `Bu bölümün (${Math.round(windowDur)} sn) anlatım akışına ve konu değişimlerine göre ideal sahne sayısına karar ver (belgesel temposu için ideal sahne süresi 18–42 saniye arasıdır; bu bölüm için en az ${autoMinScenes}, ideal olarak ${autoMinScenes}–${autoMaxScenes} sahne üret ve HİÇBİR sahne ${maxSec} saniyeyi geçmesin).`;
+          : `Bu bölümün (${Math.round(windowDur)} sn) anlatım akışına ve konu değişimlerine göre ideal sahne sayısına karar ver (ideal sahne süresi ${idealMinSec}–${idealMaxSec} saniye arasıdır; bu bölüm için en az ${autoMinScenes}, ideal olarak ${autoMinScenes}–${autoMaxScenes} sahne üret ve HİÇBİR sahne ${maxSec} saniyeyi geçmesin).`;
 
       const transcriptBlock = windowSegments
         .map(
@@ -832,8 +834,8 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
         .join('\n');
 
       const styleNote = styleDirection.trim()
-        ? `KULLANICININ ÖZEL GÖRSEL STİL TERCİHİ: ${styleDirection.trim()}`
-        : 'GÖRSEL STİL: Sinematik, gerçekçi, yüksek detaylı tarihi belgesel fotoğrafçılığı / film karesi estetiği (doğal dokular, atmosferik sinematografi, abartısız renk paleti).';
+        ? `KULLANICININ ÖZEL GÖRSEL STİL TERCİHİ (Not: Sinema/film/çözünürlük yasaklı kelimelerini kullanmadan belgesel fotoğraf diliyle uygula): ${styleDirection.trim()}`
+        : 'GÖRSEL STİL: Gerçekçi tarihsel belgesel fotoğrafçılığı (realistic historical documentary photograph, authentic editorial documentary photography, natural lighting, authentic weathered textures, muted earthy palette, full-frame edge-to-edge photograph).';
 
       const sceneResponseSchema = {
         type: Type.ARRAY,
@@ -846,7 +848,7 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
             },
             era: {
               type: Type.STRING,
-              description: 'Historical century/decade and geography in Turkish (e.g. "7. Yüzyıl (600\'ler), Hicaz" or "1959, ABD").',
+              description: 'Historical century/year and region in Turkish (e.g. "7. Yüzyıl / 610, Mekke" or "1959, Michigan ABD").',
             },
             startSec: {
               type: Type.NUMBER,
@@ -858,38 +860,63 @@ Tam olarak ${images.length} elemanlı JSON dizisi döndür.`;
             },
             imagePrompt: {
               type: Type.STRING,
-              description: 'Detailed English 16:9 2K historically accurate cinematic image generation prompt with zero anachronisms.',
+              description:
+                'Single-paragraph 55-85 word English positive-only historical documentary photograph prompt ending with "full-frame edge-to-edge photograph", containing zero cinema/film/resolution terms and zero negative "no ..." phrases.',
             },
           },
           required: ['title', 'era', 'startSec', 'endSec', 'imagePrompt'],
         },
       };
 
-      const systemInstruction = `Sen ödüllü bir belgesel yönetmeni, tarih danışmanı ve görsel prompt uzmanısın.
-Görevin, sana verilen zaman damgalı Türkçe belgesel transkriptinden, hem her sahnenin ekranda kalacağı kesin saniye aralığını hem de her sahne için 16:9 2K çözünürlükte, DÖNEMSEL OLARAK %100 TARİHİ DOĞRULUĞA SAHİP İngilizce görsel üretim promptlarını (imagePrompt) oluşturmaktır.
+      const systemInstruction = `Sen ödüllü bir belgesel yönetmeni, tarih danışmanı ve Nano Banana / Gemini görsel prompt uzmanısın.
+Görevin, sana verilen zaman damgalı Türkçe belgesel transkriptinden, hem her sahnenin ekranda kalacağı kesin saniye aralığını hem de her sahne için tarihsel olarak %100 doğru, Nano Banana / Gemini görsel üretim araçlarına optimize edilmiş İngilizce görsel promptlarını (imagePrompt) oluşturmaktır.
 
-TARİHSEL DÖNEM VE ANAKRONİZM YASAĞI (EN KRİTİK KURAL):
-- Her sahnenin geçtiği yüzyılı, on yılı ve coğrafyayı transkriptten tespit et ve "era" alanına Türkçe yaz (örn: "7. Yüzyıl (600'ler), Hicaz", "1959, Michigan ABD", "15. Yüzyıl, Osmanlı").
-- Seçilen dönemde HENÜZ İCAT EDİLMEMİŞ hiçbir nesne, kıyafet, aydınlatma veya mimari öğe prompt içinde ASLA geçmemelidir:
-  * 13. yüzyıl öncesi (örn. 600'lü yıllar / 7. yüzyıl, Antik Çağ, Erken Orta Çağ): ASLA gözlük (eyeglasses/spectacles ~1286'da icat edildi), ASLA camlı gaz lambası (kerosene/glass lamp 19. yy'da çıktı), ASLA matbaa baskı kitap, ASLA elektrik, modern düğme, fermuar, kol saati, asfalt, modern pencere camı bulunmamalıdır. Aydınlatma için yalnızca döneme uygun kil/bronz zeytinyağı kandili (clay/bronze oil lamp), balmumu mum, meşale, ocak ateşi veya doğal gün ışığı kullan; yazı malzemesi olarak parşömen/papirüs/deri rulo ve kamış kalem kullan.
-  * 1850 öncesi dönemler: Camlı gaz lambası, elektrik ampulü, fotoğraf makinesi, modern sanayi ürünleri yasaktır.
-  * 1900–1980 arası dönemler (örn. 1950'ler): Akıllı telefon, LED ekran, modern plastik, çağdaş kıyafetler yasaktır; yalnızca o on yılın gerçek mobilya, araç, giyim ve film dokusunu betimle.
-- Promptta hem döneme uygun özgün malzemeleri açıkça belirt hem de anakronizmleri engelleyen ifadeler kullan.
+GÖRSEL PROMPT ÜRETİM KURALLARI (NANO BANANA / GEMINI OPTİMİZASYONU — KESİNLİKLE UYULACAK):
 
-İMAJ PROMPTU FORMAT KURALLARI:
-- "imagePrompt" alanı, modern görsel üretim araçlarında (Imagen, Midjourney, Flux, Whisk, Nano Banana) en yüksek kaliteyi vermesi için akıcı, betimleyici ve sinematik İNGİLİZCE yazılmalıdır.
-- Her promptta şu unsurlar net biçimde yer almalıdır: kamera açısı/kadraj, ana konu ve eylem, döneme tam uyumlu kıyafet/mimari/nesneler, döneme uygun doğal ışık ve atmosfer, renk/doku kalitesi.
-- Her prompt mutlaka "16:9 widescreen aspect ratio, 2K resolution, historically accurate period details, no anachronisms, no text, no watermark" ibarelerini (doğal bütünlük içinde) içermelidir.
-- Görsellerde asla metin, yazı, tabela, filigran, çerçeve veya kolaj bölünmesi isteme (tek bir tam çerçeve 16:9 sahne).
-- "title" alanı kısa, anlaşılır TÜRKÇE sahne başlığı olmalıdır (dosya adı olarak kullanılacak; örn: "Ypsilanti Akıl Hastanesi Koğuşu (1959)").
+1. KESİN YASAKLI KELİMELER (Siyah şerit / sinema bandı ve teknik çakışma engeli):
+"imagePrompt" içinde aşağıdaki kelimeleri ve türevlerini ASLA kullanma:
+- Sinema / çerçeve tetikleyicileri: "film", "film still", "film frame", "movie", "cinema", "cinematic", "cinematography", "anamorphic", "widescreen", "letterbox", "black bars", "borders", "vignette", "screenshot"
+- Teknik boyut ve çözünürlük ifadeleri: "16:9", "aspect ratio", "1K", "2K", "4K", "8K", "resolution", "HD", "UHD"
+(En-boy oranı ve çözünürlük arayüzden ayarlanır; prompt içine kesinlikle yazılmaz.)
+
+2. YERİNE KULLANILACAK BELGESEL FOTOĞRAFÇILIK DİLİ:
+Sinema/film dili yerine her zaman belgesel fotoğrafçılık dili kullan:
+- "realistic historical documentary photograph"
+- "authentic editorial documentary photography"
+- "wide-angle photograph" / "medium shot photograph" / "close-up photograph"
+- "natural lighting", "authentic weathered textures", "muted earthy palette"
+- Her promptun sonunu KESİNLİKLE şu pozitif tam ekran ifadesiyle bitir: "full-frame edge-to-edge photograph"
+
+3. POZİTİF ANLATIM KURALI VE TARİHSEL DOĞRULUK (Olumsuz "no ..." listesi KESİNLİKLE YASAK):
+- Promptların içine "no text", "no watermark", "no black bars", "no letterbox", "no borders", "no anachronisms", "no eyeglasses", "no modern buildings", "no electricity", "no printed books" gibi "no ..." veya "without ..." ile başlayan OLUMSUZ ifadeler ASLA yazma.
+- Her sahnenin geçtiği yüzyılı, yılı ve bölgeyi transkriptten tespit et ve "era" alanına Türkçe yaz (örn: "7. Yüzyıl / 610, Mekke", "1959, Michigan ABD").
+- Seçilen dönemde henüz icat edilmemiş hiçbir nesneyi (örn. 13. yy öncesi gözlük, 1850 öncesi camlı gaz lambası veya elektrik, matbaa öncesi basılı kitap) sahneye koyma; bunu olumsuz ifade yazmadan SADECE o döneme ait gerçek unsurları pozitif betimleyerek sağla:
+  * Aydınlatma: "illuminated solely by flickering clay olive oil lamps" / "pale silver moonlight" / "natural daylight"
+  * Çevre: "surrounded exclusively by ancient mudbrick dwellings and untouched desert hills"
+  * Yazı araçları: "handwritten aged parchment scrolls and carved reed pens"
+  * 9. YÜZYIL ÖNCESİ ARAPÇA YAZI KURALI (MS 800 ÖNCESİ — 6., 7. ve 8. YÜZYIL): Sahne 9. yüzyıldan önce (MS 800 öncesi) geçiyorsa ve promptta Arapça yazı, harf, hat, el yazması, Kur'an sayfası veya "Arabic" ile ilgili herhangi bir sözcük geçiyorsa, bunu MUTLAKA "unvocalized Arabic" şeklinde pozitif olarak yaz (örn. "early unvocalized Arabic Hijazi script", "handwritten unvocalized Arabic lettering on aged parchment"). Çünkü 9. yüzyıl öncesinde hareke yoktu; olumsuz "no diacritics / no harakat" yazma, doğrudan "unvocalized Arabic" kullan.
+  * İnsan yüzü: gözlükten hiç bahsetmeden sadece doğal yüz, sakal, göz ve döneme uygun giysi dokularını tarif et.
+
+4. GÜVENLİK FİLTRESİ, DİNİ HASSASİYET VE BELGESEL DİLİ:
+- Savaş, yangın, trajedi veya çocuk içeren tarihsel sahneleri her zaman saygılı, atmosferik, uzak veya siluet açılarla ve grafik şiddet içermeden (non-graphic) betimle.
+- HZ. MUHAMMED SAHNE KURALI (YALNIZCA HZ. MUHAMMED İÇİN KESİN VE TAVİZSİZ):
+  * Bu kural YALNIZCA İslam peygamberi Hz. Muhammed (Resulullah / Peygamber Efendimiz / Son Peygamber) için geçerlidir. Hz. İsa, Hz. Musa, Musa Peygamber, Hz. İbrahim, Hz. Yusuf gibi diğer peygamberlerin sahnelerinde zorunlu arkadan çekim uygulanmaz; normal belgesel kadrajı kullanılabilir.
+  * Eğer sahne veya görsel Hz. Muhammed hakkında ise ve sahnede kendisi görünüyorsa, promptta MUTLAKA "from behind" ifadesi yer almalı ve kadraj KESİNLİKLE arkadan çekilmiş olmalıdır (örn. "photographed strictly from behind", "rear-view historical documentary photograph from behind", "back turned away from the camera", "distant rear silhouette viewed from behind").
+  * Hz. Muhammed'in yüzü, gözleri, sakalı, yüz ifadesi, önden görünümü veya yan profili ASLA betimlenmemelidir; sadece arkadan duruşu, omuzları, döneme uygun sade yün/keten cübbesinin arkası, sarığı/başörtüsünün arkası ve baktığı manzara/ufuk pozitif olarak tarif edilmelidir (olumsuz "no face" kalıbı yazmadan, tamamen arkadan kadrajla).
+
+5. UZUNLUK, FORMAT VE ÖRNEK PROMPT:
+- "title" alanı kısa, anlaşılır TÜRKÇE sahne başlığı olmalıdır (dosya adı olarak kullanılacak).
+- "imagePrompt" alanı TEK PARAGRAF, akıcı İngilizce ve KESİNLİKLE 55–85 kelime arasında olmalıdır.
+- ÖRNEK DOĞRU PROMPT:
+  "Wide-angle historical documentary photograph from behind of a forty-year-old Arab man in a rough woven wool cloak and headwrap descending steep jagged rocky slopes outside Mecca on a summer night in 610 CE, silhouette against barren desert ridges and distant mudbrick dwellings below, illuminated solely by pale silver moonlight, muted earthy nocturnal palette, authentic 7th-century Hijazi textiles and weathered stone textures, full-frame edge-to-edge photograph"
 
 ZAMANLAMA VE SÜRE ÜST SINIRI KURALLARI (KESİN):
 - İlk sahne KESİNLİKLE ${safeStart.toFixed(2)} saniyesinde başlamalıdır.
 - Son sahne KESİNLİKLE ${safeEnd.toFixed(2)} saniyesinde bitmelidir (aralığın tamamını dengeli biçimde kapla; son sahneyi uzatma!).
 - Sahneler arasında HİÇ boşluk veya çakışma olmamalıdır: her sahnenin startSec değeri bir önceki sahnenin endSec değerine eşit olmalıdır (kesintisiz akış).
 - KESİN ÜST SINIR: HİÇBİR sahne ${maxSec} saniyeden uzun OLMAMALIDIR (endSec - startSec <= ${maxSec})!
-- İdeal sahne süresi 18–42 saniye arasıdır (en az 5 saniye, en fazla ${maxSec} saniye).
-- Anlatıcı aynı konudan ${maxSec} saniyeden uzun bahsediyorsa, o bölümü mutlaka farklı görsel açılarla birden fazla sahneye böl (örn. 1. geniş mekan atmosferi -> 2. karakter/eylem orta planı -> 3. döneme özgü yakın detay çekimi). Tek bir görsel asla ${maxSec} saniyeden uzun ekranda kalmamalıdır.`;
+- İdeal sahne süresi ${idealMinSec}–${idealMaxSec} saniye arasıdır (en az 5 saniye, en fazla ${maxSec} saniye).
+- Anlatıcı aynı konudan ${maxSec} saniyeden uzun bahsediyorsa, o bölümü mutlaka farklı fotoğraf açılarıyla birden fazla sahneye böl (örn. 1. geniş açı mekan fotoğrafı -> 2. orta plan sahne fotoğrafı -> 3. yakın plan dönem detayı fotoğrafı). Tek bir görsel asla ${maxSec} saniyeden uzun ekranda kalmamalıdır.`;
 
       const prompt = `BELGESEL GENEL BAĞLAMI (Toplam Süre: ${formatMMSS(safeTotal)}):
 ${documentaryContext.trim() || '(Genel bağlam transkriptten anlaşılacaktır.)'}
@@ -904,7 +931,7 @@ ${countInstruction}
 ZAMAN DAMGALI TRANSKRİPT BÖLÜMÜ:
 ${transcriptBlock}
 
-Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için kesintisiz, her sahnesi en fazla ${maxSec} saniye süren, dönemsel olarak %100 tutarlı, 16:9 2K görsel promptlu sahne planını JSON dizisi olarak üret.`;
+Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için kesintisiz, her sahnesi en fazla ${maxSec} saniye süren, 55-85 kelimelik, yasaklı sinema/çözünürlük/olumsuz "no..." ifadelerinden tamamen arındırılmış, "full-frame edge-to-edge photograph" ile biten, dönemsel olarak %100 doğru sahne planını JSON dizisi olarak üret.`;
 
       type RawSceneItem = {
         title?: string;
@@ -923,15 +950,141 @@ Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için k
         imagePrompt: string;
       };
 
-      const ensurePromptTags = (rawPrompt: string): string => {
-        let imgPrompt = String(rawPrompt || '').trim();
-        if (!/16:9/i.test(imgPrompt)) {
-          imgPrompt += ', 16:9 widescreen aspect ratio';
+      const EXPLICIT_MUHAMMAD_RE =
+        /(?:^|[^\p{L}])(?:hz\.?\s*muhamm?[ae][dt]|muhamm?[ae][dt]|mohamm?[ae][dt]|resulullah|rasulullah|peygamber\s+efendimiz|peygamberimiz|son\s+peygamber|son\s+el[çc]i|[iİı]slam\s+peygamberi|prophet\s+muhamm?[ae][dt])(?=$|[^\p{L}])/iu;
+      const GENERIC_PROPHET_RE =
+        /(?:^|[^\p{L}])(?:peygamber(?:in|e|i|'in|'e|'i)?|the\s+prophet)(?=$|[^\p{L}])/iu;
+      const OTHER_PROPHET_RE =
+        /(?:^|[^\p{L}])(?:[iİ]sa|musa|[iİ]brahim|yusuf|davud|davut|süleyman|nuh|adem|yahya|zekeriya|eyy?[üu]b|eyüp|yakup|yakub|[iİ]smail|[iİ]shak|yunus|harun|lut|salih|hud|şuayb|[iİ]dris|[iİ]lyas|jesus|christ|moses|abraham|joseph|david|solomon|noah|adam|john\s+the\s+baptist|jonah|aaron|isaac|ishmael|jacob|elijah)(?=$|[^\p{L}])/iu;
+      const ISLAMIC_CONTEXT_RE =
+        /(?:^|[^\p{L}])(?:muhamm?[ae][dt]|mohamm?[ae][dt]|resulullah|mekke|mecca|medine|medina|hira|hicaz|hijaz|kabe|kaaba|hicret|hijra|[iİ]slam)(?=$|[^\p{L}])/iu;
+
+      const isProphetMuhammadScene = (sceneText: string): boolean => {
+        if (EXPLICIT_MUHAMMAD_RE.test(sceneText)) return true;
+        if (OTHER_PROPHET_RE.test(sceneText)) return false;
+        if (
+          GENERIC_PROPHET_RE.test(sceneText) &&
+          (ISLAMIC_CONTEXT_RE.test(sceneText) || ISLAMIC_CONTEXT_RE.test(documentaryContext))
+        ) {
+          return true;
         }
-        if (!/\b2k\b/i.test(imgPrompt)) {
-          imgPrompt += ', 2K resolution';
+        return false;
+      };
+
+      const PRE_9TH_CENTURY_RE =
+        /(?:^|[^\p{L}\d])(?:[1-8]\.\s*(?:yüzyıl|yy)|(?:[1-8](?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth)[\s-]+century|(?:ms|m\.s\.|ce|ad)\s*[1-7]\d{2}|[1-7]\d{2}\s*(?:ce|ad|yılı(?:nda)?|'ler|'lü|'lar)|m\.?ö\.?|bce|bc)(?=$|[^\p{L}\d])/iu;
+      const NINTH_OR_LATER_RE =
+        /(?:^|[^\p{L}\d])(?:(?:9|[12]\d)\.\s*(?:yüzyıl|yy)|(?:9th|[12]\d(?:st|nd|rd|th)|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|twenty-first)[\s-]+century|(?:ms|m\.s\.|ce|ad)?\s*(?:[89]\d{2}|[12]\d{3}))(?=$|[^\p{L}\d])/iu;
+
+      const isPreNinthCenturyScene = (
+        era: string,
+        title: string,
+        promptText: string,
+        transcript: string
+      ): boolean => {
+        const cleanEra = String(era || '').trim();
+        if (cleanEra) {
+          if (NINTH_OR_LATER_RE.test(cleanEra)) return false;
+          if (PRE_9TH_CENTURY_RE.test(cleanEra) || /\b[1-7]\d{2}\b/.test(cleanEra)) return true;
         }
-        return imgPrompt;
+        const combined = `${title} ${promptText} ${transcript}`;
+        if (NINTH_OR_LATER_RE.test(combined)) return false;
+        return PRE_9TH_CENTURY_RE.test(combined);
+      };
+
+      // Deterministic sanitizer enforcing all Nano Banana / Gemini rules even if LLM slips a term
+      const sanitizeDocumentaryPrompt = (
+        rawPrompt: string,
+        sceneTitle = '',
+        sceneTranscript = '',
+        sceneEra = ''
+      ): string => {
+        let p = String(rawPrompt || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        // 1. Strip any negative "no ..." or "without ..." clauses (forbidden by Rule 3)
+        p = p.replace(
+          /(?:^|[.,;]\s*|\s+)(?:no|without)\s+(?:text|watermarks?|black\s+bars?|letterbox(?:ing|ed)?|borders?|frames?|vignettes?|anachronisms?|eyeglasses|spectacles|glasses|glass\s+lamps?|kerosene\s+lamps?|gas\s+lamps?|electric(?:ity|\s+lights?|\s+lamps?)?|printed\s+books?|modern\s+[a-z][a-z\s-]{0,28}|contemporary\s+[a-z][a-z\s-]{0,28}|logos?|captions?|subtitles?|signatures?|artifacts?|people|crowds?|face|faces|facial\s+features?|diacritics?|diacritical\s+marks?|harakat|vowel\s+marks?|vowels?)\b/gi,
+          ''
+        );
+        // Catch any remaining comma-delimited ", no <short phrase>" tails
+        p = p.replace(/,\s*no\s+[a-z0-9][a-z0-9\s-]{1,32}(?=,|\.|$)/gi, '');
+
+        // 2. Replace cinema/film multi-word triggers with documentary photography equivalents
+        p = p
+          .replace(/\b(?:cinematic\s+)?(?:film\s+still|film\s+frame|movie\s+still|movie\s+frame|cinema\s+frame)\b/gi, 'historical documentary photograph')
+          .replace(/\bcinematic\s+lighting\b/gi, 'natural lighting')
+          .replace(/\bcinematic\s+shot\b/gi, 'documentary photograph')
+          .replace(/\bcinematic\s+view\b/gi, 'wide-angle documentary photograph')
+          .replace(/\bcinematic\s+photograph(?:y)?\b/gi, 'documentary photograph')
+          .replace(/\bcinematography\b/gi, 'editorial documentary photography')
+          // Strip remaining banned cinema/frame words (Rule 1)
+          .replace(/\b(?:cinematic|cinema|movie|movies|film|films|anamorphic|widescreen|letterbox(?:ed|ing)?|black\s+bars?|borders?|vignette(?:d|ing)?|screenshots?)\b/gi, '')
+          // Strip banned aspect ratio & resolution words (Rule 1)
+          .replace(/\b(?:16\s*:\s*9|aspect\s+ratio|1k|2k|4k|8k|resolution|uhd|hd)\b/gi, '');
+
+        // 3. Enforce strict rear-view ("from behind") framing ONLY for Prophet Muhammad scenes
+        const isProphetScene = isProphetMuhammadScene(`${sceneTitle} ${p} ${sceneTranscript}`);
+        if (isProphetScene) {
+          // Remove any accidental front-facing or facial descriptions positively
+          p = p
+            .replace(/\b(?:front[\s-]*view|facing\s+the\s+camera|looking\s+at\s+the\s+camera|side\s+profile|close-up\s+portrait|portrait)\b/gi, 'rear-view photograph from behind')
+            .replace(/\bwith\s+(?:a\s+)?(?:weathered|serene|calm|contemplative|bearded|aged|wise|kind|solemn|earnest)?\s*(?:face|expression|facial\s+expression|eyes|beard)(?:\s+and\s+(?:a\s+)?(?:grey|dark|short|long|neatly\s+trimmed)?\s*(?:beard|eyes|expression))?\b/gi, '')
+            .replace(/\b(?:facial\s+features?|facial\s+expression)\b/gi, '');
+
+          if (!/\bfrom\s+behind\b/i.test(p)) {
+            if (/\bphotograph\b/i.test(p)) {
+              p = p.replace(
+                /\b(photograph)\b/i,
+                '$1 from behind, back turned away from the camera,'
+              );
+            } else {
+              p = `Rear-view historical documentary photograph from behind, back turned away from the camera, ${p}`;
+            }
+          }
+        }
+
+        // 4. Enforce "unvocalized Arabic" for any Arabic script/word mention before the 9th century (< 800 CE)
+        if (isPreNinthCenturyScene(sceneEra, sceneTitle, p, sceneTranscript)) {
+          if (/\barabic\b/i.test(p) && !/\bunvocalized\s+(?:early\s+)?arabic\b/i.test(p)) {
+            p = p.replace(
+              /\b(?:(early|ancient|archaic|classical|handwritten|carved|engraved)\s+)?arabic\b/gi,
+              (_m, adj) => (adj ? `${adj} unvocalized Arabic` : 'unvocalized Arabic')
+            );
+          } else if (
+            !/\bunvocalized\s+arabic\b/i.test(p) &&
+            /\b(?:kufic|hijazi\s+script|islamic\s+calligraphy|quranic\s+(?:manuscript|script|scroll|text|calligraphy))\b/i.test(p)
+          ) {
+            p = p.replace(
+              /\b(kufic|hijazi\s+script|islamic\s+calligraphy|quranic\s+(?:manuscript|script|scroll|text|calligraphy))\b/i,
+              'unvocalized Arabic $1'
+            );
+          }
+        }
+
+        // 5. Remove any existing full-frame edge-to-edge suffix so we append cleanly once at the end
+        p = p.replace(/(?:,\s*|\.\s*|\s+)?full[\s-]*frame\s+edge[\s-]*to[\s-]*edge\s+photograph\.?$/i, '');
+
+        // 6. Normalize punctuation & whitespace artifacts after stripping
+        p = p
+          .replace(/\s+([,.;:])/g, '$1')
+          .replace(/,\s*,+/g, ',')
+          .replace(/\.\s*,/g, ',')
+          .replace(/,\s*\./g, '.')
+          .replace(/^[,.;:\s-]+/, '')
+          .replace(/[,.;:\s-]+$/, '')
+          .replace(/\b(photograph|documentary|historical|unvocalized)\s+\1\b/gi, '$1')
+          .replace(/\s{2,}/g, ' ')
+          .trim();
+
+        if (!p) {
+          p = isProphetScene
+            ? 'Wide-angle historical documentary photograph from behind, back turned away from the camera, natural lighting and weathered historical textures'
+            : 'Authentic editorial documentary photograph with natural lighting and weathered historical textures';
+        }
+
+        return `${p}, full-frame edge-to-edge photograph`;
       };
 
       const normalizeWindowScenes = (
@@ -962,16 +1115,22 @@ Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için k
           const sSec = starts[idx];
           const eSec = idx < n - 1 ? starts[idx + 1] : Number(winEnd.toFixed(2));
           const durSec = Number(Math.max(0.5, eSec - sSec).toFixed(2));
+          const cleanTitle =
+            String(item.title || '')
+              .replace(/^\d+\s*[.):\-]\s*/, '')
+              .trim() || `Sahne ${fallbackLabelStart + idx}`;
+          const sceneSegText = windowSegments
+            .filter((seg) => Number(seg.endSec) > sSec + 0.05 && Number(seg.startSec) < eSec)
+            .map((seg) => String(seg.text || ''))
+            .join(' ');
+          const cleanEra = String(item.era || '').trim();
           return {
-            title:
-              String(item.title || '')
-                .replace(/^\d+\s*[.):\-]\s*/, '')
-                .trim() || `Sahne ${fallbackLabelStart + idx}`,
-            era: String(item.era || '').trim(),
+            title: cleanTitle,
+            era: cleanEra,
             startSec: sSec,
             endSec: eSec,
             durationSec: durSec,
-            imagePrompt: ensurePromptTags(item.imagePrompt || ''),
+            imagePrompt: sanitizeDocumentaryPrompt(item.imagePrompt || '', cleanTitle, sceneSegText, cleanEra),
           };
         });
       };
@@ -1010,13 +1169,13 @@ Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için k
       const initialScenes = normalizeWindowScenes(rawItems, safeStart, safeEnd, firstNum);
 
       // Automatic split pass: if any scene STILL exceeds maxSec (e.g., > 60s), ask Hydrogen to break
-      // that exact stretch into multiple distinct visual angles (wide -> medium -> close-up detail)
-      // and apply a deterministic camera-angle split fallback if anything still exceeds maxSec.
+      // that exact stretch into multiple distinct photography angles (wide -> medium -> close-up detail)
+      // and apply a deterministic documentary-photography split fallback if anything still exceeds maxSec.
       const framingFallbacks = [
-        { suffix: ' (Geniş Plan)', prefix: 'Wide establishing cinematic view, ' },
-        { suffix: ' (Orta Plan)', prefix: 'Medium cinematic perspective focusing on subjects and period atmosphere, ' },
-        { suffix: ' (Yakın Detay)', prefix: 'Intimate close-up documentary detail shot highlighting authentic period textures and objects, ' },
-        { suffix: ' (Alternatif Açı)', prefix: 'Atmospheric low-angle cinematic documentary shot, ' },
+        { suffix: ' (Geniş Plan)', prefix: 'Wide-angle historical documentary photograph, ' },
+        { suffix: ' (Orta Plan)', prefix: 'Medium shot historical documentary photograph capturing subjects and authentic period atmosphere, ' },
+        { suffix: ' (Yakın Detay)', prefix: 'Close-up historical documentary photograph focusing on authentic weathered textures and period objects, ' },
+        { suffix: ' (Alternatif Açı)', prefix: 'Low-angle authentic editorial documentary photograph, ' },
       ];
 
       const enforceDeterministicCap = (sc: NormalizedScene): NormalizedScene[] => {
@@ -1034,7 +1193,12 @@ Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için k
             startSec: pStart,
             endSec: pEnd,
             durationSec: Number(Math.max(0.5, pEnd - pStart).toFixed(2)),
-            imagePrompt: ensurePromptTags(p === 0 ? sc.imagePrompt : `${fb.prefix}${sc.imagePrompt}`),
+            imagePrompt: sanitizeDocumentaryPrompt(
+              p === 0 ? sc.imagePrompt : `${fb.prefix}${sc.imagePrompt}`,
+              sc.title,
+              '',
+              sc.era
+            ),
           });
         }
         return out;
@@ -1050,7 +1214,8 @@ Yukarıdaki aralık (${safeStart.toFixed(2)}s -> ${safeEnd.toFixed(2)}s) için k
           continue;
         }
 
-        const targetParts = Math.max(2, Math.ceil(sc.durationSec / Math.min(36, maxSec - 10)));
+        const splitTargetDur = Math.max(8, Math.min(36, Math.round(maxSec * 0.72)));
+        const targetParts = Math.max(2, Math.ceil(sc.durationSec / splitTargetDur));
         if (splitApiCallsUsed < MAX_SPLIT_CALLS_PER_BLOCK) {
           splitApiCallsUsed++;
           try {
@@ -1076,8 +1241,10 @@ ${styleNote}
 KURALLAR:
 - Tam olarak ${targetParts} sahne üret; her biri en fazla ${maxSec} saniye (ideal ~${Math.round(sc.durationSec / targetParts)} sn) olsun.
 - İlk alt sahne ${sc.startSec.toFixed(2)}s'de başlasın, son alt sahne ${sc.endSec.toFixed(2)}s'de bitsin.
-- Her alt sahnede FARKLI bir kamera açısı, kadraj ve görsel odak kullan (örn. 1. geniş ortam planı, 2. karakter/eylem orta planı, 3. yakın dönem detayı / nesne / mimari).
-- Dönemsel doğruluğu ve anakronizm yasağını %100 koru, her prompt 16:9 2K İngilizce olsun.
+- Her alt sahnede FARKLI bir fotoğraf açısı ve odak kullan (örn. 1. wide-angle photograph, 2. medium shot photograph, 3. close-up photograph).
+- Sinema/film/çözünürlük kelimeleri ve olumsuz "no ..." kalıpları KESİNLİKLE yasak; her prompt 55-85 kelime, pozitif tarihsel betimlemeli ve "full-frame edge-to-edge photograph" ile bitsin.
+- Sahne yalnızca Hz. Muhammed hakkında ise tüm alt sahnelerde MUTLAKA "from behind" (arkadan görünüm) kullan ve yüzünü kesinlikle betimleme (Hz. İsa, Hz. Musa gibi diğer peygamberler bu kurala dahil değildir).
+- Sahne 9. yüzyıl öncesindeyse ve Arapça yazı/harf/hat geçiyorsa MUTLAKA "unvocalized Arabic" ifadesini kullan.
 
 BU ARALIĞIN TRANSKRİPTİ:
 ${subTranscript}`;

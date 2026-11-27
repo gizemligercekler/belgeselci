@@ -539,21 +539,20 @@ export function formatHHMMSS(sec: number): string {
 
 /**
  * Formats generated Hydrogen scenes into a single unified .txt file containing
- * exact scene timestamps (100% compatible with Step 1 .TXT upload) + 16:9 2K image prompts.
+ * exact scene timestamps (100% compatible with Step 1 .TXT upload) + Nano Banana / Gemini documentary prompts.
  */
 export function scenePlanToUnifiedTxt(items: GeneratedScenePlanItem[]): string {
   return items
     .map((item) => {
       const durRounded = Math.max(1, Math.round(item.durationSec));
-      const lines = [
+      const cleanPrompt = item.imagePrompt.replace(/\s+/g, ' ').trim();
+      const eraLabel = item.era?.trim() || 'Belgesel Dönemi';
+      return [
         `${item.orderNumber}. ${item.title}`,
         `Zaman: ${formatHHMMSS(item.startSec)} - ${formatHHMMSS(item.endSec)} (${durRounded} saniye)`,
-      ];
-      if (item.era?.trim()) {
-        lines.push(`Dönem: ${item.era.trim()}`);
-      }
-      lines.push(`Prompt: ${item.imagePrompt.trim()}`);
-      return lines.join('\n');
+        `Dönem: ${eraLabel}`,
+        `Prompt: ${cleanPrompt}`,
+      ].join('\n');
     })
     .join('\n\n');
 }
@@ -563,6 +562,6 @@ export function scenePlanToUnifiedTxt(items: GeneratedScenePlanItem[]): string {
  */
 export function scenePlanToPromptsOnlyTxt(items: GeneratedScenePlanItem[]): string {
   return items
-    .map((item) => `${item.orderNumber}. ${item.imagePrompt.trim()}`)
+    .map((item) => `${item.orderNumber}. ${item.imagePrompt.replace(/\s+/g, ' ').trim()}`)
     .join('\n\n');
 }
