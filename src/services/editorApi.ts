@@ -1,4 +1,6 @@
 import {
+  DialogueSubtitleEntry,
+  DialogueSubtitleKind,
   EditorSettings,
   GeneratedScenePlanItem,
   TimelineScene,
@@ -682,6 +684,163 @@ export async function generateScenePlanWithHydrogen(
 
   return {
     scenes: normalized,
+    modelUsed: lastModelUsed,
+  };
+}
+
+export interface DialogueSubtitleProgress {
+  currentBlock: number;
+  totalBlocks: number;
+  extractedCount: number;
+  message: string;
+}
+
+const DIALOGUE_SINGLE_CALL_MAX_SEC = 1500; // <= 25 minutes -> 1 single Hydrogen call
+const DIALOGUE_BLOCK_SEC = 1200; // 20-minute blocks for 1-hour documentaries (~3 calls total)
+const DIALOGUE_INTER_BLOCK_DELAY_MS = 1200;
+
+/**
+ * Extracts ONLY direct dialogues (kings, prophets, priests, historical quotes) and sacred scripture
+ * verses (Quran, Torah, Bible) from a full timestamped transcript via free Gemini 4 Hydrogen,
+ * strictly anchored to original Deepgram timestamps.
+ */
+export async function extractDialogueSubtitlesWithHydrogen(
+  transcriptSegments: TranscriptSegment[],
+  totalDurationSec: number,
+  settings: EditorSettings,
+  options?: ApiCallOptions & {
+    onProgress?: (progress: DialogueSubtitleProgress) => void;
+    onPartialEntries?: (entries: DialogueSubtitleEntry[]) => void;
+  }
+): Promise<{ entries: DialogueSubtitleEntry[]; modelUsed: string }> {
+  if (transcriptSegments.length === 0) {
+    throw new Error('Seçme altyazı çıkarmak için önce transkript çıkarılmalı veya .SRT yüklenmelidir.');
+  }
+
+  const maxSegEnd = transcriptSegments.reduce((m, s) => Math.max(m, s.endSec), 0);
+  const effectiveTotal = round2(Math.max(2, totalDurationSec || maxSegEnd));
+
+  const windows: Array<{ startSec: number; endSec: number }> = [];
+  if (effectiveTotal <= DIALOGUE_SINGLE_CALL_MAX_SEC) {
+    windows.push({ startSec: 0, endSec: effectiveTotal });
+  } else {
+    let cursor = 0;
+    while (cursor < effectiveTotal - 1) {
+      const remaining = effectiveTotal - cursor;
+      const nextEnd =
+        remaining <= DIALOGUE_BLOCK_SEC + 300
+          ? effectiveTotal
+          : round2(cursor + DIALOGUE_BLOCK_SEC);
+      windows.push({ startSec: round2(cursor), endSec: nextEnd });
+      cursor = nextEnd;
+    }
+  }
+
+  const documentaryContext = transcriptSegments
+    .slice(0, 16)
+    .map((s) => s.text)
+    .join(' ')
+    .slice(0, 800);
+
+  const modelChain = buildAlignmentModelChain('gemini-4-hydrogen');
+  const allEntries: DialogueSubtitleEntry[] = [];
+  let lastModelUsed = 'gemini-4-hydrogen';
+  let currentModelIdx = 0;
+
+  for (let bIdx = 0; bIdx < windows.length; bIdx++) {
+    if (options?.signal?.aborted) {
+      throw new DOMException('Seçme altyazı çıkarma işlemi iptal edildi.', 'AbortError');
+    }
+
+    const win = windows[bIdx];
+    const indexedSegments = transcriptSegments
+      .map((seg, idx) => ({ idx, ...seg }))
+      .filter((seg) => seg.endSec > win.startSec + 0.05 && seg.startSec < win.endSec);
+
+    if (indexedSegments.length === 0) continue;
+
+    options?.onProgress?.({
+      currentBlock: bIdx + 1,
+      totalBlocks: windows.length,
+      extractedCount: allEntries.length,
+      message:
+        windows.length === 1
+          ? 'Gemini 4 Hydrogen ile diyaloglar ve ayet alıntıları ayıklanıyor...'
+          : `Gemini 4 Hydrogen ile diyalog ve ayet taraması: Bölüm ${bIdx + 1}/${windows.length}...`,
+    });
+
+    const { data, usedModelIndex } = await sendWithModelFailover<{
+      entries: Array<{
+        startSec: number;
+        endSec: number;
+        source: string;
+        text: string;
+        kind: DialogueSubtitleKind;
+      }>;
+      modelUsed?: string;
+    }>(
+      '/api/extract-dialogue-subtitles',
+      modelChain,
+      currentModelIdx,
+      (modelName) => {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (settings.customApiKey.trim()) {
+          headers['x-gemini-api-key'] = settings.customApiKey.trim();
+        }
+        return {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            indexedSegments,
+            documentaryContext,
+            model: modelName,
+          }),
+        };
+      },
+      `Seçme altyazı Bölüm ${bIdx + 1}/${windows.length}`,
+      options
+    );
+
+    currentModelIdx = usedModelIndex;
+    lastModelUsed = data.modelUsed || modelChain[usedModelIndex] || 'gemini-4-hydrogen';
+
+    const rawEntries = Array.isArray(data.entries) ? data.entries : [];
+    for (const item of rawEntries) {
+      const startSec = round2(Math.max(0, Number(item.startSec) || 0));
+      const endSec = round2(Math.max(startSec + 0.8, Number(item.endSec) || startSec + 3));
+      const text = String(item.text || '').trim();
+      if (!text) continue;
+
+      // Avoid near-duplicate entries across block boundaries
+      const isDuplicate = allEntries.some(
+        (existing) =>
+          Math.abs(existing.startSec - startSec) < 1.0 &&
+          existing.text.toLocaleLowerCase('tr-TR') === text.toLocaleLowerCase('tr-TR')
+      );
+      if (isDuplicate) continue;
+
+      allEntries.push({
+        id: `dsub-${Date.now()}-${allEntries.length}-${Math.random().toString(36).slice(2, 6)}`,
+        startSec,
+        endSec,
+        source: String(item.source || '').trim() || 'Konuşmacı',
+        text,
+        kind: item.kind === 'ayet' || item.kind === 'alinti' ? item.kind : 'diyalog',
+      });
+    }
+
+    allEntries.sort((a, b) => a.startSec - b.startSec);
+    options?.onPartialEntries?.([...allEntries]);
+
+    if (bIdx < windows.length - 1) {
+      await sleepWithAbort(DIALOGUE_INTER_BLOCK_DELAY_MS, options?.signal);
+    }
+  }
+
+  return {
+    entries: allEntries,
     modelUsed: lastModelUsed,
   };
 }

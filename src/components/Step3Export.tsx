@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   Download,
   ArrowLeft,
@@ -9,8 +9,18 @@ import {
   Check,
   Copy,
   Subtitles,
+  Palette,
+  Upload,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
-import { TimelineScene, TranscriptSegment } from '../types/editor';
+import {
+  DialogueSubtitleEntry,
+  SubtitleSourceMode,
+  SubtitleStyleConfig,
+  TimelineScene,
+  TranscriptSegment,
+} from '../types/editor';
 import {
   buildTimelineJson,
   downloadKurguPaketiZip,
@@ -20,6 +30,7 @@ import {
 } from '../utils/exportBundle';
 import { segmentsToSrt } from '../utils/mediaUtils';
 import { formatMMSS, formatZoomSpeedPct } from '../utils/timelineMath';
+import { SubtitleStyleEditor } from './SubtitleStyleEditor';
 
 interface Step3ExportProps {
   audioFileName: string;
@@ -27,9 +38,16 @@ interface Step3ExportProps {
   zoomSpeedPerSec: number;
   burnSubtitles: boolean;
   transcriptSegments: TranscriptSegment[];
+  selectiveSubtitles: DialogueSubtitleEntry[];
+  subtitleSourceMode: SubtitleSourceMode;
+  subtitleStyle: SubtitleStyleConfig;
+  activeSubtitleSegments: TranscriptSegment[];
   scenes: TimelineScene[];
   onChangeAudioFileName: (name: string) => void;
   onToggleSubtitles: (enabled: boolean) => void;
+  onChangeSubtitleSourceMode: (mode: SubtitleSourceMode) => void;
+  onChangeSubtitleStyle: (style: SubtitleStyleConfig) => void;
+  onUploadCustomSelectiveSrt: (file: File) => void;
   onBackToTimeline: () => void;
 }
 
@@ -41,19 +59,30 @@ export const Step3Export: React.FC<Step3ExportProps> = ({
   zoomSpeedPerSec,
   burnSubtitles,
   transcriptSegments,
+  selectiveSubtitles,
+  subtitleSourceMode,
+  subtitleStyle,
+  activeSubtitleSegments,
   scenes,
   onChangeAudioFileName,
   onToggleSubtitles,
+  onChangeSubtitleSourceMode,
+  onChangeSubtitleStyle,
+  onUploadCustomSelectiveSrt,
   onBackToTimeline,
 }) => {
+  const customSrtInputRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState<PreviewTab>('readme');
+  const [showStyleEditor, setShowStyleEditor] = useState(true);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadedOnce, setDownloadedOnce] = useState(false);
   const [copiedTab, setCopiedTab] = useState<PreviewTab | null>(null);
 
-  const hasSubtitlesAvailable = transcriptSegments.length > 0;
+  const hasSubtitlesAvailable = activeSubtitleSegments.length > 0;
   const effectiveBurnSubtitles = burnSubtitles && hasSubtitlesAvailable;
   const packageFileCount = effectiveBurnSubtitles ? 4 : 3;
+  const isUsingSelective =
+    subtitleSourceMode === 'selective' && selectiveSubtitles.length > 0;
 
   const isLosslessAudio = /\.(wav|aif|aiff|flac)$/i.test(audioFileName);
   const outputVideoName = isLosslessAudio ? 'belgesel_1080p.mov' : 'belgesel_1080p.mp4';
@@ -66,19 +95,20 @@ export const Step3Export: React.FC<Step3ExportProps> = ({
           totalAudioDuration,
           zoomSpeedPerSec,
           scenes,
-          effectiveBurnSubtitles
+          effectiveBurnSubtitles,
+          subtitleStyle
         ),
         null,
         2
       ),
-    [audioFileName, totalAudioDuration, zoomSpeedPerSec, scenes, effectiveBurnSubtitles]
+    [audioFileName, totalAudioDuration, zoomSpeedPerSec, scenes, effectiveBurnSubtitles, subtitleStyle]
   );
 
   const renderPyStr = useMemo(() => generateRenderPy(), []);
 
   const subtitlesSrtStr = useMemo(
-    () => (hasSubtitlesAvailable ? segmentsToSrt(transcriptSegments) : ''),
-    [hasSubtitlesAvailable, transcriptSegments]
+    () => (hasSubtitlesAvailable ? segmentsToSrt(activeSubtitleSegments) : ''),
+    [hasSubtitlesAvailable, activeSubtitleSegments]
   );
 
   const readmeStr = useMemo(
@@ -123,7 +153,8 @@ export const Step3Export: React.FC<Step3ExportProps> = ({
         zoomSpeedPerSec,
         scenes,
         effectiveBurnSubtitles,
-        transcriptSegments
+        activeSubtitleSegments,
+        subtitleStyle
       );
       setDownloadedOnce(true);
     } finally {
@@ -208,7 +239,9 @@ export const Step3Export: React.FC<Step3ExportProps> = ({
           <div>
             <p className="text-[11px] text-[#64748B]">Altyazı</p>
             <p className="mt-1 font-mono text-xs text-[#F1F5F9]">
-              {effectiveBurnSubtitles ? 'Açık (Gömülü)' : 'Kapalı'}
+              {effectiveBurnSubtitles
+                ? `${isUsingSelective ? 'Seçme' : 'Tam'} (${activeSubtitleSegments.length} satır)`
+                : 'Kapalı'}
             </p>
           </div>
           <div>
@@ -217,9 +250,21 @@ export const Step3Export: React.FC<Step3ExportProps> = ({
           </div>
         </div>
 
-        {/* Optional Burn Subtitles Switch */}
-        {hasSubtitlesAvailable && (
-          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-md border border-white/[0.07] bg-[#0B0F17]/70 px-4 py-3">
+        {/* Optional Burn Subtitles Switch + Source Picker + Visual Style Editor */}
+        <div className="mt-5 space-y-3 rounded-md border border-white/[0.07] bg-[#0B0F17]/70 p-4">
+          <input
+            ref={customSrtInputRef}
+            type="file"
+            accept=".srt,text/plain"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) onUploadCustomSelectiveSrt(file);
+              e.target.value = '';
+            }}
+          />
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-start gap-2.5">
               <Subtitles
                 className={`mt-0.5 h-4 w-4 shrink-0 ${
@@ -231,27 +276,109 @@ export const Step3Export: React.FC<Step3ExportProps> = ({
                   Videoya Altyazı Göm (İsteğe Bağlı)
                 </p>
                 <p className="mt-0.5 text-[11px] text-[#94A3B8]">
-                  Açık olduğunda pakete <span className="font-mono text-[#CBD5E1]">subtitles.srt</span> eklenir ve{' '}
-                  <span className="font-mono text-[#CBD5E1]">render.py</span> Türkçe UTF-8 altyazıyı 1080p videonun altına sinematik stille işler.
+                  Açık olduğunda pakete <span className="font-mono text-[#CBD5E1]">subtitles.srt</span> ve seçtiğiniz
+                  yazı stili eklenir; <span className="font-mono text-[#CBD5E1]">render.py</span> 1080p videoya birebir işler.
                 </p>
               </div>
             </div>
 
-            <button
-              type="button"
-              role="switch"
-              aria-checked={effectiveBurnSubtitles}
-              onClick={() => onToggleSubtitles(!burnSubtitles)}
-              className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
-                effectiveBurnSubtitles
-                  ? 'border-[#D99B26]/60 bg-[#D99B26]/15 text-[#F1F5F9]'
-                  : 'border-white/[0.1] bg-[#131924] text-[#94A3B8] hover:border-white/[0.2] hover:text-[#F1F5F9]'
-              }`}
-            >
-              <span>{effectiveBurnSubtitles ? 'Altyazı Açık' : 'Altyazı Kapalı'}</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => customSrtInputRef.current?.click()}
+                className="flex items-center gap-1.5 rounded-md border border-white/[0.1] bg-[#131924] px-2.5 py-1.5 text-xs text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9]"
+              >
+                <Upload className="h-3.5 w-3.5 text-[#D99B26]" />
+                <span>Özel .SRT Yükle</span>
+              </button>
+
+              {hasSubtitlesAvailable && (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={effectiveBurnSubtitles}
+                  onClick={() => onToggleSubtitles(!burnSubtitles)}
+                  className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
+                    effectiveBurnSubtitles
+                      ? 'border-[#D99B26]/60 bg-[#D99B26]/15 text-[#F1F5F9]'
+                      : 'border-white/[0.1] bg-[#131924] text-[#94A3B8] hover:border-white/[0.2] hover:text-[#F1F5F9]'
+                  }`}
+                >
+                  <span>{effectiveBurnSubtitles ? 'Altyazı Açık' : 'Altyazı Kapalı'}</span>
+                </button>
+              )}
+            </div>
           </div>
-        )}
+
+          {effectiveBurnSubtitles && (
+            <div className="space-y-3 border-t border-white/[0.06] pt-3">
+              {/* Source Switcher + Style Editor Toggle */}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex flex-wrap rounded-md border border-white/[0.08] bg-[#131924] p-0.5">
+                  {selectiveSubtitles.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => onChangeSubtitleSourceMode('selective')}
+                      className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                        isUsingSelective
+                          ? 'bg-[#D99B26]/20 text-[#F1F5F9]'
+                          : 'text-[#94A3B8] hover:text-[#F1F5F9]'
+                      }`}
+                    >
+                      Seçme Diyalog &amp; Ayet ({selectiveSubtitles.length} satır)
+                    </button>
+                  )}
+                  {transcriptSegments.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => onChangeSubtitleSourceMode('full')}
+                      className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                        !isUsingSelective
+                          ? 'bg-[#D99B26]/20 text-[#F1F5F9]'
+                          : 'text-[#94A3B8] hover:text-[#F1F5F9]'
+                      }`}
+                    >
+                      Tam Transkript ({transcriptSegments.length} satır)
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setShowStyleEditor((v) => !v)}
+                  className="flex items-center gap-1.5 rounded-md border border-white/[0.1] bg-[#131924] px-2.5 py-1 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9]"
+                >
+                  <Palette className="h-3.5 w-3.5 text-[#D99B26]" />
+                  <span>Altyazı Stili</span>
+                  {showStyleEditor ? (
+                    <ChevronUp className="h-3.5 w-3.5" />
+                  ) : (
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </div>
+
+              {showStyleEditor && (
+                <SubtitleStyleEditor
+                  style={subtitleStyle}
+                  onChange={onChangeSubtitleStyle}
+                  showSourceToggle={isUsingSelective}
+                  sampleSource={
+                    isUsingSelective ? selectiveSubtitles[0]?.source || 'Kral' : ''
+                  }
+                  sampleText={
+                    isUsingSelective
+                      ? selectiveSubtitles[0]?.text ||
+                        '"Bu topraklarda hakikat, kılıçtan daha uzun yaşar."'
+                      : activeSubtitleSegments[0]?.text ||
+                        'Tarihin en kritik dönemeçlerinden biri bu topraklarda yaşandı.'
+                  }
+                  compact
+                />
+              )}
+            </div>
+          )}
+        </div>
 
         {/* Optional Local Audio Filename Input (helpful when user uploaded SRT/TXT or wants silent video-only render) */}
         <div className="mt-5 flex flex-col justify-between gap-3 rounded-md border border-white/[0.07] bg-[#0B0F17]/70 px-4 py-3 sm:flex-row sm:items-center">

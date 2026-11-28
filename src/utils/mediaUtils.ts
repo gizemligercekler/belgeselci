@@ -1,4 +1,5 @@
 import {
+  DialogueSubtitleEntry,
   GeneratedScenePlanItem,
   TimingPlanEntry,
   TranscriptSegment,
@@ -564,4 +565,75 @@ export function scenePlanToPromptsOnlyTxt(items: GeneratedScenePlanItem[]): stri
   return items
     .map((item) => `${item.orderNumber}. ${item.imagePrompt.replace(/\s+/g, ' ').trim()}`)
     .join('\n\n');
+}
+
+/**
+ * Formats a selective dialogue/scripture subtitle entry for display and SRT export.
+ * - Avoids double colons when source already contains a citation colon (e.g. "Bakara: 15 — \"...\"" or "Matta 5:9 — \"...\"").
+ * - Uses "Kaynak: ..." for speaker labels (e.g. "Kral: \"...\"").
+ * - Returns only the quoted text when source is empty.
+ */
+export function formatDialogueSubtitleLine(
+  entry: Pick<DialogueSubtitleEntry, 'source' | 'text'>,
+  includeSourcePrefix = true
+): string {
+  const cleanText = entry.text.replace(/\s+/g, ' ').trim();
+  const cleanSource = entry.source.replace(/[:\s]+$/, '').trim();
+  if (!cleanText) return '';
+  if (includeSourcePrefix && cleanSource) {
+    const sep = cleanSource.includes(':') ? ' — ' : ': ';
+    return `${cleanSource}${sep}${cleanText}`;
+  }
+  return cleanText;
+}
+
+/**
+ * Converts selective DialogueSubtitleEntry items into standard TranscriptSegment[]
+ * ready for live video preview and segmentsToSrt() export.
+ */
+export function dialogueEntriesToSegments(
+  entries: DialogueSubtitleEntry[],
+  includeSourcePrefix = true
+): TranscriptSegment[] {
+  return [...entries]
+    .sort((a, b) => a.startSec - b.startSec)
+    .map((entry) => ({
+      startSec: Number(Math.max(0, entry.startSec).toFixed(2)),
+      endSec: Number(Math.max(entry.startSec + 0.5, entry.endSec).toFixed(2)),
+      text: formatDialogueSubtitleLine(entry, includeSourcePrefix),
+    }))
+    .filter((seg) => seg.text.length > 0);
+}
+
+/**
+ * Converts selective dialogue/scripture entries directly into valid UTF-8 .SRT text.
+ */
+export function dialogueEntriesToSrt(
+  entries: DialogueSubtitleEntry[],
+  includeSourcePrefix = true
+): string {
+  return segmentsToSrt(dialogueEntriesToSegments(entries, includeSourcePrefix));
+}
+
+/**
+ * Parses flexible user time inputs like "01:24", "00:01:24", "01:24.5", or "84.5" into seconds.
+ * Returns null if invalid.
+ */
+export function parseFlexibleTimeSec(raw: string): number | null {
+  const s = raw.trim().replace(',', '.');
+  if (!s) return null;
+  if (/^\d+(?:\.\d+)?$/.test(s)) {
+    const val = Number(s);
+    return Number.isFinite(val) && val >= 0 ? Number(val.toFixed(2)) : null;
+  }
+  const parts = s.split(':');
+  if (parts.length === 2 || parts.length === 3) {
+    const nums = parts.map((p) => Number(p));
+    if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
+    if (parts.length === 2) {
+      return Number((nums[0] * 60 + nums[1]).toFixed(2));
+    }
+    return Number((nums[0] * 3600 + nums[1] * 60 + nums[2]).toFixed(2));
+  }
+  return null;
 }

@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import {
   FIXED_DISSOLVE_SEC,
+  SubtitleStyleConfig,
   TimelineScene,
   TranscriptSegment,
   UploadedImage,
@@ -35,6 +36,7 @@ import {
 import { segmentsToSrt } from '../utils/mediaUtils';
 import { downloadTextFile } from '../utils/exportBundle';
 import { RetryNotice } from '../services/editorApi';
+import { getSubtitlePreviewPresentation } from './SubtitleStyleEditor';
 
 interface Step2TimelineProps {
   audioFileName: string;
@@ -42,11 +44,14 @@ interface Step2TimelineProps {
   totalAudioDuration: number;
   zoomSpeedPerSec: number;
   burnSubtitles: boolean;
+  subtitleStyle: SubtitleStyleConfig;
+  subtitleSourceLabel?: string;
   alignmentModelUsed: string;
   isRealigning: boolean;
   realignRetryNotice: RetryNotice | null;
   realignError: string | null;
   transcriptSegments: TranscriptSegment[];
+  activeSubtitleSegments: TranscriptSegment[];
   scenes: TimelineScene[];
   images: UploadedImage[];
   onChangeZoomSpeed: (nextSpeed: number) => void;
@@ -98,11 +103,14 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
   totalAudioDuration,
   zoomSpeedPerSec,
   burnSubtitles,
+  subtitleStyle,
+  subtitleSourceLabel,
   alignmentModelUsed,
   isRealigning,
   realignRetryNotice,
   realignError,
   transcriptSegments,
+  activeSubtitleSegments,
   scenes,
   images,
   onChangeZoomSpeed,
@@ -302,9 +310,14 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
   const prevImgUrl = prevScene ? imageUrlByFilename.get(prevScene.filename) : undefined;
 
   const activeSubtitleText = useMemo(() => {
-    if (!burnSubtitles || transcriptSegments.length === 0) return '';
-    return findSubtitleAtTime(transcriptSegments, playheadSec);
-  }, [burnSubtitles, transcriptSegments, playheadSec]);
+    if (!burnSubtitles || activeSubtitleSegments.length === 0) return '';
+    return findSubtitleAtTime(activeSubtitleSegments, playheadSec);
+  }, [burnSubtitles, activeSubtitleSegments, playheadSec]);
+
+  const subtitlePresentation = useMemo(
+    () => getSubtitlePreviewPresentation(subtitleStyle, isFullscreen ? 1.45 : 1.0),
+    [subtitleStyle, isFullscreen]
+  );
 
   const handleStepScene = useCallback(
     (delta: number) => {
@@ -685,11 +698,12 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
 
               {/* Optional Live Synchronized Turkish Subtitles (Matches render.py styling) */}
               {burnSubtitles && activeSubtitleText && (
-                <div className="pointer-events-none absolute inset-x-4 bottom-5 flex justify-center sm:inset-x-10 sm:bottom-7">
+                <div
+                  className={`pointer-events-none absolute inset-x-4 sm:inset-x-10 ${subtitlePresentation.containerPositionClass}`}
+                >
                   <p
-                    className={`max-w-[85%] rounded bg-black/75 px-3.5 py-1.5 text-center font-medium leading-snug text-white shadow-lg ${
-                      isFullscreen ? 'text-lg sm:text-2xl' : 'text-xs sm:text-base'
-                    }`}
+                    className="max-w-[88%] whitespace-pre-line text-center"
+                    style={subtitlePresentation.textStyle}
                   >
                     {activeSubtitleText}
                   </p>
@@ -769,7 +783,7 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
                 {/* Optional Subtitle Toggle (Live Preview + Render Export) */}
                 <button
                   type="button"
-                  disabled={transcriptSegments.length === 0}
+                  disabled={activeSubtitleSegments.length === 0}
                   onClick={() => onToggleSubtitles(!burnSubtitles)}
                   title="Canlı önizleme ve dışa aktarılan videoda isteğe bağlı Türkçe altyazıyı aç/kapat"
                   className={`flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
@@ -779,7 +793,9 @@ export const Step2Timeline: React.FC<Step2TimelineProps> = ({
                   }`}
                 >
                   <Subtitles className={`h-3.5 w-3.5 ${burnSubtitles ? 'text-[#D99B26]' : ''}`} />
-                  <span>Altyazı: {burnSubtitles ? 'Açık' : 'Kapalı'}</span>
+                  <span>
+                    Altyazı: {burnSubtitles ? (subtitleSourceLabel ? `Açık (${subtitleSourceLabel})` : 'Açık') : 'Kapalı'}
+                  </span>
                 </button>
 
                 {/* Full Screen Toggle */}

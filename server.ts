@@ -1302,6 +1302,260 @@ ${subTranscript}`;
     }
   });
 
+  // 4. Extract Selective Dialogue & Sacred Scripture Subtitles (.SRT) via Gemini 4 Hydrogen (Free Tier)
+  app.post('/api/extract-dialogue-subtitles', async (req: Request, res: Response) => {
+    try {
+      const apiKey = resolveGeminiKey(req);
+      if (!apiKey) {
+        res.status(401).json({
+          error:
+            'Gemini API anahtarı bulunamadı. Ayarlar penceresinden anahtar girin veya sunucu GEMINI_API_KEY değişkenini tanımlayın.',
+        });
+        return;
+      }
+
+      const {
+        indexedSegments = [],
+        documentaryContext = '',
+        model = 'gemini-4-hydrogen',
+      } = req.body as {
+        indexedSegments?: Array<{ idx: number; startSec: number; endSec: number; text: string }>;
+        documentaryContext?: string;
+        model?: string;
+      };
+
+      if (!Array.isArray(indexedSegments) || indexedSegments.length === 0) {
+        res.status(400).json({ error: 'Altyazı çıkarılacak transkript bölümü boş.' });
+        return;
+      }
+
+      const segByIdx = new Map<number, { idx: number; startSec: number; endSec: number; text: string }>();
+      for (const s of indexedSegments) {
+        if (s && Number.isFinite(Number(s.idx))) {
+          segByIdx.set(Number(s.idx), {
+            idx: Number(s.idx),
+            startSec: Number(s.startSec) || 0,
+            endSec: Number(s.endSec) || 0,
+            text: String(s.text || '').trim(),
+          });
+        }
+      }
+
+      const transcriptLines = indexedSegments
+        .map(
+          (s) =>
+            `[#${s.idx} | ${formatMMSS(Number(s.startSec))}-${formatMMSS(Number(s.endSec))} (${Number(s.startSec).toFixed(2)}s-${Number(s.endSec).toFixed(2)}s)] ${String(s.text || '').trim()}`
+        )
+        .join('\n');
+
+      const systemInstruction = `Sen ödüllü bir Türkçe belgesel editörü, dinler tarihi araştırmacısı ve altyazı uzmanısın.
+Görevin, sana verilen zaman damgalı Türkçe belgesel transkripti içinden YALNIZCA videonun üzerine özel sinematik altyazı olarak basılacak en vurucu doğrudan konuşmaları (diyalogları) ve kutsal metin / tarihi metin alıntılarını ayıklamaktır.
+
+HANGİ SATIRLARI SEÇECEKSİN (SADECE BUNLAR):
+1. "diyalog": Bir kralın, peygamberin, rahibin, komutanın, bilginin veya tarihi bir şahsın doğrudan ağzından aktarılan sözler ve karşılıklı soru-cevap diyalogları (örn. "Kral şöyle dedi: ...", "Rahip ona şu cevabı verdi: ...", "Peygamber buyurdu ki: ...").
+2. "ayet": Kur'an-ı Kerim ayetleri, Tevrat pasajları, İncil / Zebur ayetleri veya kutsal kitaplardan doğrudan yapılan alıntı/okumalar.
+3. "alinti": Doğrudan metinden okunan önemli tarihi mektup, ferman, kitabe veya klasik eser cümleleri (yalnızca gerçekten doğrudan alıntı okunuyorsa).
+
+KESİNLİKLE SEÇMEYECEKLERİN:
+- Normal belgesel dış ses anlatımı, tarihsel açıklama, özet, yorum veya geçiş cümlelerini ASLA alma!
+- Çok seçici ol: 1 saatlik bir belgeselin tamamında genellikle yalnızca 5–18 satır (20 dakikalık bir bölümde ortalama 1–6 satır) gerçekten bu kapsama girer. Eğer verilen bölümde hiç doğrudan diyalog veya kutsal metin alıntısı yoksa KESİNLİKLE boş dizi ([]) döndür; zorla satır uydurma!
+
+KAYNAK / REFERANS ("source") KURALLARI — ÇOK ÖNEMLİ:
+- "ayet" türü için: Okunan ayetin Kur'an-ı Kerim, Tevrat, İncil veya Zebur'da TAM OLARAK hangi sure/kitap ve bölüm:ayet numarasında geçtiğini tespit etmeye çalış!
+  * Transkriptte geçiyorsa VEYA ayet metninden kesin olarak tanıyabiliyorsan tam referansı kısa Türkçe biçimde yaz:
+    - Kur'an-ı Kerim örnekleri: "Bakara: 15", "Âl-i İmrân: 189", "Enfal: 30", "Yûsuf: 4" (aralık varsa "Bakara: 15-16").
+    - Tevrat / İncil / Zebur örnekleri: "Matta 5:9", "Çölde Sayım 6:24", "Daniel 2:20", "Yaratılış 1:1", "Mezmurlar 23:1" (sadece bölüm kesinse "Matta: 1", "Çölde Sayım: 1").
+  * KESİN KURAL: Ayetin tam sure/kitap + ayet/bölüm numarasından %100 emin değilsen ASLA tahmin yürütme veya numara uydurma! Ayrıca "Kur'an Ayeti", "Kur'an", "Tevrat", "İncil", "Zebur", "Kutsal Metin" gibi genel/belirsiz kitap adlarını ASLA yazma — emin olamadığında "source" alanını mutlaka BOŞ STRİNG ("") bırak! Böylece ekranda yalnızca ayetin kendisi tırnak içinde ("...") görünür.
+- "diyalog" türü için: Konuşan kişinin kısa ve net Türkçe adını/unvanını yaz (örn: "Kral Nabukadnezar", "Başrahip", "Hz. Musa", "Firavun", "Kral").
+- "alinti" türü için: Varsa eserin/yazarın/kitabenin spesifik adını yaz (örn: "Herodot", "Kiros Silindiri"); yoksa "" bırak.
+
+ZAMANLAMA VE METİN KURALLARI:
+- Her seçilen satır için transkriptteki tam başlangıç ve bitiş satır numaralarını (startSegmentIdx, endSegmentIdx) ve o alıntının transkript içindeki kesin saniye aralığını (startSec, endSec) ver.
+- Eğer bir diyalog veya ayet uzun bir transkript satırının sadece ikinci yarısında başlıyorsa (örneğin satırın başında "Kral öfkeyle haykırdı:" veya "Tevrat'ta şöyle buyrulur:" anlatıcı girişi varsa), "text" alanına SADECE söylenen sözü/ayeti yaz ve "startSec" değerini o sözün başladığı yaklaşık saniyeye koy (ancak mutlaka ilgili segmentin [startSec .. endSec] aralığı içinde kal).
+- "text" alanına anlatıcının giriş sözlerini koyma; yalnızca söylenen diyalog cümlesini veya okunan ayet/alıntı metnini düzgün Türkçe imla ile çift tırnak içinde ("...") yaz.
+- Uzun bir diyalog veya karşılıklı iki kişinin konuşması varsa, her konuşmacının sözünü AYRI bir altyazı öğesi olarak ver (ekranda kolay okunsun; her öğe tercihen 1–2 cümle ve 4–12 saniye arası olsun).`;
+
+      const prompt = `BELGESEL BAĞLAMI:
+${documentaryContext.trim() || '(Genel bağlam transkriptten anlaşılacaktır.)'}
+
+NUMARALI VE ZAMAN DAMGALI TRANSKRİPT BÖLÜMÜ:
+${transcriptLines}
+
+Yukarıdaki transkript içinden YALNIZCA doğrudan diyalogları, karşılıklı konuşmaları ve kutsal metin (Kur'an, Tevrat, İncil) / doğrudan tarihi metin alıntılarını JSON dizisi olarak çıkar. Ayetlerde kesin sure/kitap + ayet referansını ("Bakara: 15", "Matta 5:9", "Daniel 2:20", "Çölde Sayım: 1" gibi) yalnızca %100 eminsen yaz; emin değilsen "source" alanını "" (boş) bırak. Hiç uygun satır yoksa [] döndür.`;
+
+      const ai = createGenAIClient(apiKey);
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                startSegmentIdx: {
+                  type: Type.INTEGER,
+                  description: 'Exact segment #idx from the input where this dialogue/verse begins.',
+                },
+                endSegmentIdx: {
+                  type: Type.INTEGER,
+                  description: 'Exact segment #idx from the input where this dialogue/verse ends.',
+                },
+                startSec: {
+                  type: Type.NUMBER,
+                  description: 'Start timestamp in seconds anchored within startSegmentIdx.',
+                },
+                endSec: {
+                  type: Type.NUMBER,
+                  description: 'End timestamp in seconds anchored within endSegmentIdx.',
+                },
+                source: {
+                  type: Type.STRING,
+                  description:
+                    'For diyalog: speaker name (e.g. "Kral", "Başrahip"). For ayet: EXACT scripture citation with chapter/verse number in Turkish (e.g. "Bakara: 15", "Matta 5:9", "Çölde Sayım: 1", "Daniel 2:20") ONLY if 100% certain; NEVER output generic book names like "Kur\'an Ayeti" or "Tevrat"—use empty string "" instead when uncertain.',
+                },
+                text: {
+                  type: Type.STRING,
+                  description: 'Exact Turkish spoken quote or sacred verse text cleanly wrapped in double quotes ("...").',
+                },
+                kind: {
+                  type: Type.STRING,
+                  description: 'Category: "diyalog", "ayet", or "alinti".',
+                },
+              },
+              required: ['startSegmentIdx', 'endSegmentIdx', 'startSec', 'endSec', 'source', 'text', 'kind'],
+            },
+          },
+        },
+      });
+
+      const rawText = (response.text ?? '[]')
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/```\s*$/i, '')
+        .trim();
+
+      const parsed = JSON.parse(rawText) as Array<{
+        startSegmentIdx?: number;
+        endSegmentIdx?: number;
+        startSec?: number;
+        endSec?: number;
+        source?: string;
+        text?: string;
+        kind?: string;
+      }>;
+
+      const rawItems = Array.isArray(parsed) ? parsed : [];
+      const entries: Array<{
+        startSec: number;
+        endSec: number;
+        source: string;
+        text: string;
+        kind: 'diyalog' | 'ayet' | 'alinti';
+      }> = [];
+
+      const minWinSec = indexedSegments[0].startSec;
+      const maxWinSec = indexedSegments[indexedSegments.length - 1].endSec;
+
+      const GENERIC_SCRIPTURE_ONLY_RE =
+        /^(?:kur['’]?an(?:-ı\s*kerim)?(?:\s+ayeti)?|tevrat(?:\s+ayeti|\s+pasajı)?|[iİ]ncil(?:\s+ayeti)?|zebur(?:\s+ayeti)?|kutsal\s+(?:kitap|metin)|kitab-ı\s*mukaddes|eski\s+ahit|yeni\s+ahit|ayet)$/i;
+
+      const ensureQuotedText = (raw: string): string => {
+        const cleaned = raw.replace(/\s+/g, ' ').trim();
+        if (!cleaned) return '';
+        if (
+          (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+          (cleaned.startsWith('“') && cleaned.endsWith('”'))
+        ) {
+          return cleaned;
+        }
+        const stripped = cleaned.replace(/^["“”']+/, '').replace(/["“”']+$/, '').trim();
+        return stripped ? `"${stripped}"` : '';
+      };
+
+      for (const item of rawItems) {
+        const rawTextVal = String(item?.text || '').replace(/\s+/g, ' ').trim();
+        if (!rawTextVal) continue;
+
+        const sIdx = Number(item.startSegmentIdx);
+        const eIdx = Number(item.endSegmentIdx);
+        const startSeg = segByIdx.get(sIdx);
+        const endSeg = segByIdx.get(Number.isFinite(eIdx) ? Math.max(sIdx, eIdx) : sIdx) || startSeg;
+
+        // Anchor strictly to the real Deepgram segment bounds so timestamps can NEVER drift
+        let sSec = Number(item.startSec);
+        let eSec = Number(item.endSec);
+
+        if (startSeg) {
+          if (!Number.isFinite(sSec) || sSec < startSeg.startSec - 0.5 || sSec > startSeg.endSec) {
+            sSec = startSeg.startSec;
+          } else {
+            sSec = Math.max(startSeg.startSec, sSec);
+          }
+        } else {
+          sSec = Number.isFinite(sSec) ? Math.max(minWinSec, Math.min(maxWinSec - 0.5, sSec)) : minWinSec;
+        }
+
+        if (endSeg) {
+          if (!Number.isFinite(eSec) || eSec > endSeg.endSec + 0.5 || eSec <= sSec) {
+            eSec = endSeg.endSec;
+          } else {
+            eSec = Math.min(endSeg.endSec, eSec);
+          }
+        } else {
+          eSec = Number.isFinite(eSec) ? Math.min(maxWinSec, Math.max(sSec + 1.5, eSec)) : sSec + 3;
+        }
+
+        if (eSec <= sSec + 0.4) {
+          eSec = Math.min(maxWinSec, sSec + 1.5);
+        }
+
+        const rawKind = String(item.kind || '').toLowerCase();
+        const kind: 'diyalog' | 'ayet' | 'alinti' =
+          rawKind === 'ayet' ? 'ayet' : rawKind === 'alinti' ? 'alinti' : 'diyalog';
+
+        let source = String(item.source || '')
+          .replace(/[:\s]+$/, '')
+          .trim();
+
+        if (kind === 'ayet') {
+          // Only keep source if it's a real specific chapter/verse citation (contains a digit and is not a generic label).
+          // Otherwise leave source empty so only the quoted verse ("...") is displayed.
+          if (!source || !/\d/.test(source) || GENERIC_SCRIPTURE_ONLY_RE.test(source)) {
+            source = '';
+          }
+        } else if (kind === 'diyalog') {
+          source = source || 'Konuşmacı';
+        }
+
+        const text = ensureQuotedText(rawTextVal);
+        if (!text) continue;
+
+        entries.push({
+          startSec: Number(sSec.toFixed(2)),
+          endSec: Number(eSec.toFixed(2)),
+          source,
+          text,
+          kind,
+        });
+      }
+
+      entries.sort((a, b) => a.startSec - b.startSec);
+      res.json({ entries, modelUsed: model });
+    } catch (err) {
+      const parsedErr = parseErrorStatus(err);
+      console.error('[/api/extract-dialogue-subtitles] error:', parsedErr.upstreamStatus, parsedErr.code, parsedErr.message);
+      res.status(parsedErr.httpStatus).json({
+        error: parsedErr.message,
+        code: parsedErr.code,
+        upstreamStatus: parsedErr.upstreamStatus,
+        retryable: parsedErr.retryable,
+      });
+    }
+  });
+
   // Always return JSON for /api middleware errors (e.g. PayloadTooLargeError / invalid JSON)
   app.use(
     '/api',

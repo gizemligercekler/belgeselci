@@ -1,5 +1,11 @@
 import JSZip from 'jszip';
-import { FIXED_DISSOLVE_SEC, TimelineScene, TranscriptSegment } from '../types/editor';
+import {
+  DEFAULT_SUBTITLE_STYLE,
+  FIXED_DISSOLVE_SEC,
+  SubtitleStyleConfig,
+  TimelineScene,
+  TranscriptSegment,
+} from '../types/editor';
 import { formatMMSS, formatZoomSpeedPct } from './timelineMath';
 import { segmentsToSrt } from './mediaUtils';
 
@@ -12,6 +18,7 @@ export interface ExportTimelinePayload {
   fps: 30;
   burnSubtitles: boolean;
   subtitleFile: string | null;
+  subtitleStyle?: SubtitleStyleConfig;
   scenes: Array<{
     orderNumber: number;
     filename: string;
@@ -32,7 +39,8 @@ export function buildTimelineJson(
   totalAudioDuration: number,
   zoomSpeedPerSec: number,
   scenes: TimelineScene[],
-  burnSubtitles = false
+  burnSubtitles = false,
+  subtitleStyle: SubtitleStyleConfig = DEFAULT_SUBTITLE_STYLE
 ): ExportTimelinePayload {
   return {
     audioFile: audioFileName,
@@ -43,6 +51,7 @@ export function buildTimelineJson(
     fps: 30,
     burnSubtitles,
     subtitleFile: burnSubtitles ? 'subtitles.srt' : null,
+    ...(burnSubtitles ? { subtitleStyle } : {}),
     scenes: scenes.map((sc) => ({
       orderNumber: sc.orderNumber,
       filename: sc.filename,
@@ -287,6 +296,78 @@ def hierarchical_xfade(
     return current_paths[0]
 
 
+def hex_to_ass_color(hex_color: str, opacity_pct: float = 100.0) -> str:
+    """Converts #RRGGBB + opacity (0..100%) into ASS &HAABBGGRR format."""
+    cleaned = str(hex_color or "#FFFFFF").strip().lstrip("#")
+    if len(cleaned) == 3:
+        cleaned = "".join(c * 2 for c in cleaned)
+    if len(cleaned) != 6:
+        cleaned = "FFFFFF"
+    try:
+        r = int(cleaned[0:2], 16)
+        g = int(cleaned[2:4], 16)
+        b = int(cleaned[4:6], 16)
+    except ValueError:
+        r, g, b = 255, 255, 255
+    op = max(0.0, min(100.0, float(opacity_pct)))
+    # In ASS, alpha 00 = fully opaque, FF = fully transparent
+    alpha = int(round((1.0 - op / 100.0) * 255))
+    return f"&H{alpha:02X}{b:02X}{g:02X}{r:02X}"
+
+
+def build_ass_force_style(style_cfg: dict | None) -> str:
+    cfg = style_cfg if isinstance(style_cfg, dict) else {}
+    font_name = str(cfg.get("fontName") or "Georgia").replace("'", "").replace(",", "")
+    font_size = max(12, min(48, int(round(float(cfg.get("fontSize", 22))))))
+    bold = -1 if cfg.get("bold", False) else 0
+    italic = -1 if cfg.get("italic", False) else 0
+    primary = hex_to_ass_color(str(cfg.get("textColor") or "#FEF3C7"), 100.0)
+    bg_mode = str(cfg.get("backgroundMode") or "box")
+    bg_hex = str(cfg.get("backgroundColor") or "#000000")
+    bg_opacity = float(cfg.get("backgroundOpacity", 72))
+    outline_w = max(0, min(6, int(round(float(cfg.get("outlineWidth", 2))))))
+    position = str(cfg.get("position") or "bottom")
+
+    if position == "center":
+        alignment = 5
+        margin_v = 20
+    elif position == "lower_mid":
+        alignment = 2
+        margin_v = 96
+    else:
+        alignment = 2
+        margin_v = 38
+
+    if bg_mode == "box":
+        # In libass BorderStyle=3 (opaque box), OutlineColour controls the box fill & alpha,
+        # and Outline sets the box padding around the text.
+        box_color = hex_to_ass_color(bg_hex, bg_opacity)
+        border_style = 3
+        outline_col = box_color
+        back_col = box_color
+        outline_val = 6
+        shadow_val = 0
+    elif bg_mode == "outline":
+        border_style = 1
+        outline_col = "&H00000000"
+        back_col = "&H80000000"
+        outline_val = max(1, outline_w)
+        shadow_val = 1
+    else:
+        border_style = 1
+        outline_col = "&H00000000"
+        back_col = "&H90000000"
+        outline_val = 0
+        shadow_val = 1
+
+    return (
+        f"FontName={font_name},FontSize={font_size},Bold={bold},Italic={italic},"
+        f"PrimaryColour={primary},OutlineColour={outline_col},BackColour={back_col},"
+        f"BorderStyle={border_style},Outline={outline_val},Shadow={shadow_val},"
+        f"Alignment={alignment},MarginL=72,MarginR=72,MarginV={margin_v}"
+    )
+
+
 def burn_subtitles_onto_video(
     ffmpeg_bin: str,
     input_video: Path,
@@ -294,18 +375,14 @@ def burn_subtitles_onto_video(
     out_video: Path,
     base_dir: Path,
     fps: int,
+    subtitle_style: dict | None = None,
 ) -> None:
     """
-    Burns UTF-8 Turkish SRT subtitles with crisp documentary styling.
+    Burns UTF-8 Turkish SRT subtitles using the exact user-configured style from timeline.json.
     Runs with cwd=base_dir and relative subtitle filename so Windows drive letters
     (e.g. C:\\...) never break FFmpeg's subtitles filter escaping.
     """
-    style = (
-        "FontName=Arial,FontSize=20,"
-        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-        "BackColour=&H96000000,BorderStyle=3,Outline=1,Shadow=0,"
-        "Alignment=2,MarginL=80,MarginR=80,MarginV=36"
-    )
+    style = build_ass_force_style(subtitle_style)
     vf = f"subtitles='{subtitle_filename}':charenc=UTF-8:force_style='{style}'"
 
     cmd = [
@@ -467,7 +544,8 @@ def main() -> None:
 
         video_for_mux = merged_video
         if burn_subtitles:
-            print(f"\\nAltyazilar ({subtitle_name}) videoya isleniyor...")
+            subtitle_style = data.get("subtitleStyle")
+            print(f"\\nAltyazilar ({subtitle_name}) secili stille videoya isleniyor...")
             subtitled_video = tmp_dir / "merged_subtitled.mp4"
             burn_subtitles_onto_video(
                 ffmpeg_bin=ffmpeg_bin,
@@ -476,6 +554,7 @@ def main() -> None:
                 out_video=subtitled_video,
                 base_dir=base_dir,
                 fps=fps,
+                subtitle_style=subtitle_style,
             )
             video_for_mux = subtitled_video
 
@@ -621,7 +700,8 @@ export async function downloadKurguPaketiZip(
   zoomSpeedPerSec: number,
   scenes: TimelineScene[],
   burnSubtitles = false,
-  transcriptSegments: TranscriptSegment[] = []
+  transcriptSegments: TranscriptSegment[] = [],
+  subtitleStyle: SubtitleStyleConfig = DEFAULT_SUBTITLE_STYLE
 ): Promise<void> {
   const zip = new JSZip();
   const includeSubs = burnSubtitles && transcriptSegments.length > 0;
@@ -631,7 +711,8 @@ export async function downloadKurguPaketiZip(
     totalAudioDuration,
     zoomSpeedPerSec,
     scenes,
-    includeSubs
+    includeSubs,
+    subtitleStyle
   );
 
   zip.file('timeline.json', JSON.stringify(timelinePayload, null, 2));

@@ -15,14 +15,23 @@ import {
   X,
   ListOrdered,
   Clapperboard,
+  MessageSquareQuote,
+  Plus,
+  Trash2,
+  Palette,
 } from 'lucide-react';
 import {
+  DialogueSubtitleEntry,
+  DialogueSubtitleKind,
   EditorSettings,
   GeneratedScenePlanItem,
+  SubtitleStyleConfig,
   TranscriptSegment,
 } from '../types/editor';
 import {
+  dialogueEntriesToSrt,
   formatHHMMSS,
+  parseFlexibleTimeSec,
   parseSrtToSegments,
   readAudioDuration,
   scenePlanToPromptsOnlyTxt,
@@ -32,16 +41,21 @@ import {
 import { formatMMSS } from '../utils/timelineMath';
 import { downloadTextFile } from '../utils/exportBundle';
 import {
+  DialogueSubtitleProgress,
+  extractDialogueSubtitlesWithHydrogen,
   generateScenePlanWithHydrogen,
   RetryNotice,
   ScenePlanProgress,
   TranscribeProgress,
   transcribeAudioInChunks,
 } from '../services/editorApi';
+import { SubtitleStyleEditor } from './SubtitleStyleEditor';
 
 interface StandaloneTranscriberProps {
   settings: EditorSettings;
   hasDeepgramKey: boolean;
+  subtitleStyle: SubtitleStyleConfig;
+  onChangeSubtitleStyle: (next: SubtitleStyleConfig) => void;
   onOpenSettings: () => void;
   onUseTranscriptInEditor: (
     segments: TranscriptSegment[],
@@ -49,7 +63,8 @@ interface StandaloneTranscriberProps {
     audioFile: File | null,
     durationSec: number,
     generatedPlan?: GeneratedScenePlanItem[],
-    planFileName?: string
+    planFileName?: string,
+    selectiveSubtitles?: DialogueSubtitleEntry[]
   ) => void;
 }
 
@@ -60,6 +75,8 @@ function stripExtension(filename: string): string {
 export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
   settings,
   hasDeepgramKey,
+  subtitleStyle,
+  onChangeSubtitleStyle,
   onOpenSettings,
   onUseTranscriptInEditor,
 }) => {
@@ -68,6 +85,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
   const audioElRef = useRef<HTMLAudioElement>(null);
   const transcribeAbortRef = useRef<AbortController | null>(null);
   const planAbortRef = useRef<AbortController | null>(null);
+  const selectiveAbortRef = useRef<AbortController | null>(null);
 
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [audioObjectUrl, setAudioObjectUrl] = useState<string | null>(null);
@@ -83,7 +101,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
 
   // Transcript viewer state
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
-  const [activeRightTab, setActiveRightTab] = useState<'transcript' | 'plan'>('transcript');
+  const [activeRightTab, setActiveRightTab] = useState<'transcript' | 'plan' | 'selective'>('transcript');
   const [viewMode, setViewMode] = useState<'timed' | 'plain'>('timed');
   const [searchQuery, setSearchQuery] = useState('');
   const [copiedType, setCopiedType] = useState<string | null>(null);
@@ -102,6 +120,18 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
   const [planViewMode, setPlanViewMode] = useState<'cards' | 'txt'>('cards');
   const [planSearchQuery, setPlanSearchQuery] = useState('');
 
+  // Hydrogen Selective Dialogue & Scripture Subtitle Extractor state
+  const [isExtractingSelective, setIsExtractingSelective] = useState(false);
+  const [selectiveProgress, setSelectiveProgress] = useState<DialogueSubtitleProgress | null>(null);
+  const [selectiveRetryNotice, setSelectiveRetryNotice] = useState<RetryNotice | null>(null);
+  const [selectiveError, setSelectiveError] = useState<string | null>(null);
+  const [selectiveEntries, setSelectiveEntries] = useState<DialogueSubtitleEntry[]>([]);
+  const [selectiveModelUsed, setSelectiveModelUsed] = useState<string>('');
+  const [selectiveViewMode, setSelectiveViewMode] = useState<'edit' | 'srt' | 'style'>('edit');
+  const [selectiveTimeDrafts, setSelectiveTimeDrafts] = useState<
+    Record<string, { start?: string; end?: string }>
+  >({});
+
   const audioUrlRef = useRef<string | null>(null);
   audioUrlRef.current = audioObjectUrl;
 
@@ -109,6 +139,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
     return () => {
       transcribeAbortRef.current?.abort();
       planAbortRef.current?.abort();
+      selectiveAbortRef.current?.abort();
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
     };
   }, []);
@@ -116,6 +147,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
   const handleLoadSrtFile = async (file: File) => {
     setErrorMessage(null);
     setPlanError(null);
+    setSelectiveError(null);
     try {
       const text = await file.text();
       const parsed = parseSrtToSegments(text);
@@ -131,6 +163,8 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
       }
       setScenePlan([]);
       setPlanModelUsed('');
+      setSelectiveEntries([]);
+      setSelectiveModelUsed('');
       setActiveRightTab('transcript');
     } catch {
       setErrorMessage('SRT dosyası okunamadı.');
@@ -145,6 +179,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
 
     setErrorMessage(null);
     setPlanError(null);
+    setSelectiveError(null);
     try {
       const { durationSec, objectUrl } = await readAudioDuration(file);
       if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
@@ -155,6 +190,8 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
       setSegments([]);
       setScenePlan([]);
       setPlanModelUsed('');
+      setSelectiveEntries([]);
+      setSelectiveModelUsed('');
       setSearchQuery('');
       setPlanSearchQuery('');
       setCurrentPlaySec(-1);
@@ -167,6 +204,7 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
   const handleClearAll = () => {
     transcribeAbortRef.current?.abort();
     planAbortRef.current?.abort();
+    selectiveAbortRef.current?.abort();
     if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
     setAudioFile(null);
     setAudioObjectUrl(null);
@@ -175,10 +213,13 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
     setSegments([]);
     setScenePlan([]);
     setPlanModelUsed('');
+    setSelectiveEntries([]);
+    setSelectiveModelUsed('');
     setSearchQuery('');
     setPlanSearchQuery('');
     setErrorMessage(null);
     setPlanError(null);
+    setSelectiveError(null);
     setCurrentPlaySec(-1);
     setActiveRightTab('transcript');
   };
@@ -289,6 +330,124 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
     }
   };
 
+  const handleExtractSelectiveSubtitles = async () => {
+    if (segments.length === 0 || isExtractingSelective) return;
+
+    const controller = new AbortController();
+    selectiveAbortRef.current = controller;
+
+    setIsExtractingSelective(true);
+    setSelectiveError(null);
+    setSelectiveRetryNotice(null);
+    setSelectiveEntries([]);
+    setSelectiveTimeDrafts({});
+    setActiveRightTab('selective');
+    setSelectiveViewMode('edit');
+
+    try {
+      const effectiveDur =
+        audioDuration > 0
+          ? audioDuration
+          : segments.reduce((m, s) => Math.max(m, s.endSec), 0);
+
+      const { entries, modelUsed } = await extractDialogueSubtitlesWithHydrogen(
+        segments,
+        effectiveDur,
+        settings,
+        {
+          signal: controller.signal,
+          onProgress: (p) => setSelectiveProgress(p),
+          onRetryWait: (notice) => setSelectiveRetryNotice(notice),
+          onPartialEntries: (partial) => setSelectiveEntries(partial),
+        }
+      );
+
+      if (controller.signal.aborted) return;
+
+      setSelectiveEntries(entries);
+      setSelectiveModelUsed(modelUsed);
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') {
+        setSelectiveError('Seçme altyazı ayıklama işlemi iptal edildi.');
+      } else {
+        setSelectiveError(
+          err instanceof Error
+            ? err.message
+            : 'Hydrogen ile diyalog & ayet altyazısı çıkarılırken bir hata oluştu.'
+        );
+      }
+    } finally {
+      setIsExtractingSelective(false);
+      setSelectiveProgress(null);
+      setSelectiveRetryNotice(null);
+      selectiveAbortRef.current = null;
+    }
+  };
+
+  const handleUpdateSelectiveEntry = (
+    id: string,
+    patch: Partial<Omit<DialogueSubtitleEntry, 'id'>>
+  ) => {
+    setSelectiveEntries((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  };
+
+  const handleCommitSelectiveTime = (id: string, field: 'start' | 'end') => {
+    const draft = selectiveTimeDrafts[id]?.[field];
+    setSelectiveTimeDrafts((prev) => {
+      const next = { ...prev };
+      if (next[id]) {
+        const copy = { ...next[id] };
+        delete copy[field];
+        if (!copy.start && !copy.end) delete next[id];
+        else next[id] = copy;
+      }
+      return next;
+    });
+    if (draft === undefined) return;
+    const parsed = parseFlexibleTimeSec(draft);
+    if (parsed === null) return;
+    const maxCap = Math.max(audioDuration, 86400);
+    const clamped = Math.max(0, Math.min(maxCap, parsed));
+    setSelectiveEntries((prev) => {
+      const updated = prev.map((item) => {
+        if (item.id !== id) return item;
+        if (field === 'start') {
+          const nextEnd = Math.max(clamped + 0.5, item.endSec);
+          return { ...item, startSec: clamped, endSec: nextEnd };
+        }
+        const nextEnd = Math.max(item.startSec + 0.5, clamped);
+        return { ...item, endSec: nextEnd };
+      });
+      return [...updated].sort((a, b) => a.startSec - b.startSec);
+    });
+  };
+
+  const handleDeleteSelectiveEntry = (id: string) => {
+    setSelectiveEntries((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  const handleAddManualSelectiveEntry = () => {
+    const startSec =
+      currentPlaySec >= 0
+        ? Number(currentPlaySec.toFixed(2))
+        : selectiveEntries.length > 0
+          ? Number((selectiveEntries[selectiveEntries.length - 1].endSec + 1).toFixed(2))
+          : 0;
+    const endSec = Number((startSec + 4).toFixed(2));
+    const newEntry: DialogueSubtitleEntry = {
+      id: `manual_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      startSec,
+      endSec,
+      kind: 'diyalog',
+      source: 'Konuşmacı',
+      text: '',
+    };
+    setSelectiveEntries((prev) => [...prev, newEntry].sort((a, b) => a.startSec - b.startSec));
+    setSelectiveViewMode('edit');
+  };
+
   const handleSeekTo = (sec: number) => {
     const el = audioElRef.current;
     if (!el) return;
@@ -328,6 +487,10 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
 
   const unifiedPlanTxt = useMemo(() => scenePlanToUnifiedTxt(scenePlan), [scenePlan]);
   const promptsOnlyTxt = useMemo(() => scenePlanToPromptsOnlyTxt(scenePlan), [scenePlan]);
+  const selectiveSrtText = useMemo(
+    () => dialogueEntriesToSrt(selectiveEntries, subtitleStyle.includeSourcePrefix),
+    [selectiveEntries, subtitleStyle.includeSourcePrefix]
+  );
 
   const planDurationStats = useMemo(() => {
     if (scenePlan.length === 0) return { avgSec: 0, maxSec: 0 };
@@ -373,6 +536,15 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
     downloadTextFile(`${baseName}.srt`, segmentsToSrt(segments), 'application/x-subrip;charset=utf-8');
   };
 
+  const handleDownloadSelectiveSrt = () => {
+    if (!selectiveSrtText) return;
+    downloadTextFile(
+      `${baseName}_secme_diyalog_ayet.srt`,
+      selectiveSrtText,
+      'application/x-subrip;charset=utf-8'
+    );
+  };
+
   const handleDownloadTranscriptTxt = () => {
     if (!plainText) return;
     downloadTextFile(`${baseName}_transkript.txt`, plainText, 'text/plain;charset=utf-8');
@@ -400,9 +572,14 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
       ? Math.round(((planProgress.currentBlock - 0.4) / planProgress.totalBlocks) * 95)
       : 12;
 
+  const selectivePercent =
+    selectiveProgress && selectiveProgress.totalBlocks > 0
+      ? Math.round(((selectiveProgress.currentBlock - 0.4) / selectiveProgress.totalBlocks) * 95)
+      : 15;
+
   const deepgramModel = settings.deepgramModel === 'nova-2' ? 'nova-2' : 'nova-3';
   const hasAnyDeepgramKey = Boolean(settings.deepgramApiKey.trim() || hasDeepgramKey);
-  const busy = isTranscribing || isGeneratingPlan;
+  const busy = isTranscribing || isGeneratingPlan || isExtractingSelective;
 
   return (
     <div className="mx-auto max-w-[1220px] space-y-6 px-4 py-8 sm:px-6">
@@ -799,13 +976,95 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
               </button>
             )}
           </div>
+
+          {/* Stage 3: Hydrogen Selective Dialogue & Scripture Subtitle Extractor */}
+          <div className="space-y-3.5 border-t border-white/[0.08] pt-5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-sm font-medium text-[#F1F5F9]">
+                <MessageSquareQuote className="h-4 w-4 text-[#D99B26]" />
+                <span>3. Seçme Altyazı (Diyalog &amp; Ayet)</span>
+              </div>
+              <span className="font-mono text-[11px] text-[#64748B]">.SRT · Free</span>
+            </div>
+
+            <p className="text-xs leading-relaxed text-[#94A3B8]">
+              Anlatıcıyı atlayıp yalnızca karşılıklı diyalogları (kral, peygamber, rahip konuşmaları) ve
+              kutsal metin ayetlerini (Kur&apos;an, Tevrat, İncil) kaynak etiketiyle özel{' '}
+              <span className="font-mono text-[#CBD5E1]">.SRT</span> olarak ayıklar. Çıkan satırları elle
+              düzenleyip yazı stilini belirleyebilirsiniz.
+            </p>
+
+            {selectiveError && (
+              <div className="flex items-start gap-2.5 rounded-md border border-rose-500/30 bg-rose-950/30 px-3 py-2 text-xs text-rose-200">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+                <p className="leading-relaxed">{selectiveError}</p>
+              </div>
+            )}
+
+            {isExtractingSelective ? (
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#D99B26]" />
+                    <span className="truncate text-xs font-medium text-[#F1F5F9]">
+                      {selectiveProgress?.message || 'Hydrogen diyalog ve ayetleri ayıklıyor...'}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => selectiveAbortRef.current?.abort()}
+                    className="shrink-0 rounded-md border border-white/[0.1] px-2.5 py-1 text-xs font-medium text-[#94A3B8] hover:border-rose-400/40 hover:text-rose-300"
+                  >
+                    İptal Et
+                  </button>
+                </div>
+
+                {selectiveRetryNotice !== null && (
+                  <p className="font-mono text-xs tabular-nums text-[#D99B26]">
+                    {selectiveRetryNotice.reason} — {selectiveRetryNotice.secondsLeft} sn sonra yeniden denenecek...
+                  </p>
+                )}
+
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#0B0F17]">
+                  <div
+                    className="h-full bg-[#D99B26] transition-all duration-300"
+                    style={{ width: `${Math.max(10, selectivePercent)}%` }}
+                  />
+                </div>
+
+                {selectiveEntries.length > 0 && (
+                  <p className="font-mono text-[11px] tabular-nums text-[#64748B]">
+                    Şu ana kadar {selectiveEntries.length} diyalog / ayet satırı bulundu...
+                  </p>
+                )}
+              </div>
+            ) : (
+              <button
+                type="button"
+                disabled={segments.length === 0 || isTranscribing || isGeneratingPlan}
+                onClick={handleExtractSelectiveSubtitles}
+                className={`flex w-full items-center justify-center gap-2 rounded-md border px-4 py-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                  segments.length > 0
+                    ? 'cursor-pointer border-[#D99B26]/50 bg-[#D99B26]/12 text-[#F1F5F9] hover:bg-[#D99B26]/22'
+                    : 'border-white/[0.1] bg-[#0B0F17] text-[#64748B]'
+                }`}
+              >
+                <MessageSquareQuote className="h-3.5 w-3.5 text-[#D99B26]" />
+                <span>
+                  {selectiveEntries.length > 0
+                    ? 'Hydrogen ile Diyalog & Ayetleri Yeniden Ayıkla'
+                    : 'Hydrogen ile Diyalog & Ayet Ayıkla'}
+                </span>
+              </button>
+            )}
+          </div>
         </section>
 
-        {/* Right: Unified Tabbed Output (Transkript | Sahne Planı & Promptlar) */}
+        {/* Right: Unified Tabbed Output (Transkript | Sahne Planı & Promptlar | Seçme Altyazı) */}
         <section className="flex flex-col rounded-lg border border-white/[0.08] bg-[#131924] p-6 lg:col-span-7">
           {/* Output Tab Switcher */}
           <div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.07] pb-4">
-            <div className="inline-flex rounded-md border border-white/[0.08] bg-[#0B0F17] p-0.5">
+            <div className="inline-flex flex-wrap rounded-md border border-white/[0.08] bg-[#0B0F17] p-0.5">
               <button
                 type="button"
                 onClick={() => setActiveRightTab('transcript')}
@@ -831,7 +1090,21 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
               >
                 <ListOrdered className="h-3.5 w-3.5 text-[#D99B26]" />
                 <span>
-                  Sahne Planı &amp; Promptlar{scenePlan.length > 0 ? ` (${scenePlan.length})` : ''}
+                  Sahne Planı{scenePlan.length > 0 ? ` (${scenePlan.length})` : ''}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveRightTab('selective')}
+                className={`flex items-center gap-1.5 whitespace-nowrap rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+                  activeRightTab === 'selective'
+                    ? 'bg-[#1A2230] text-[#F1F5F9]'
+                    : 'text-[#94A3B8] hover:text-[#F1F5F9]'
+                }`}
+              >
+                <MessageSquareQuote className="h-3.5 w-3.5 text-[#D99B26]" />
+                <span>
+                  Seçme Altyazı{selectiveEntries.length > 0 ? ` (${selectiveEntries.length})` : ''}
                 </span>
               </button>
             </div>
@@ -844,6 +1117,11 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
             {activeRightTab === 'plan' && scenePlan.length > 0 && (
               <p className="font-mono text-xs tabular-nums text-[#64748B]">
                 {scenePlan.length} sahne · ort. {planDurationStats.avgSec} sn · maks. {planDurationStats.maxSec} sn · full-frame
+              </p>
+            )}
+            {activeRightTab === 'selective' && selectiveEntries.length > 0 && (
+              <p className="font-mono text-xs tabular-nums text-[#64748B]">
+                {selectiveEntries.length} seçme satır{selectiveModelUsed ? ` · ${selectiveModelUsed}` : ''}
               </p>
             )}
           </div>
@@ -1215,13 +1493,320 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
             </>
           )}
 
+          {/* TAB 3: SELECTIVE DIALOGUE & SCRIPTURE SUBTITLES (.SRT) + VISUAL STYLE */}
+          {activeRightTab === 'selective' && (
+            <div className="space-y-4">
+              {/* Sub-mode & Export Toolbar */}
+              <div className="flex flex-wrap items-center justify-between gap-2.5">
+                <div className="inline-flex rounded-md border border-white/[0.08] bg-[#0B0F17] p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setSelectiveViewMode('edit')}
+                    className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
+                      selectiveViewMode === 'edit'
+                        ? 'bg-[#1A2230] text-[#F1F5F9]'
+                        : 'text-[#94A3B8] hover:text-[#F1F5F9]'
+                    }`}
+                  >
+                    Satırları Düzenle
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectiveViewMode('srt')}
+                    className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
+                      selectiveViewMode === 'srt'
+                        ? 'bg-[#1A2230] text-[#F1F5F9]'
+                        : 'text-[#94A3B8] hover:text-[#F1F5F9]'
+                    }`}
+                  >
+                    .SRT Önizleme
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectiveViewMode('style')}
+                    className={`flex items-center gap-1 rounded px-3 py-1 text-xs font-medium transition-colors ${
+                      selectiveViewMode === 'style'
+                        ? 'bg-[#1A2230] text-[#F1F5F9]'
+                        : 'text-[#94A3B8] hover:text-[#F1F5F9]'
+                    }`}
+                  >
+                    <Palette className="h-3 w-3 text-[#D99B26]" />
+                    <span>Stil &amp; Görünüm</span>
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleAddManualSelectiveEntry}
+                    className="flex items-center gap-1 whitespace-nowrap rounded-md border border-white/[0.1] bg-[#0B0F17] px-2.5 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#F1F5F9]"
+                  >
+                    <Plus className="h-3.5 w-3.5 text-[#D99B26]" />
+                    <span>Satır Ekle</span>
+                  </button>
+
+                  {selectiveEntries.length > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => copyToClipboard(selectiveSrtText, 'selective-srt')}
+                        className="flex items-center gap-1.5 whitespace-nowrap rounded-md border border-white/[0.1] bg-[#0B0F17] px-2.5 py-1.5 text-xs font-medium text-[#CBD5E1] transition-colors hover:border-white/[0.2] hover:text-[#F1F5F9]"
+                      >
+                        {copiedType === 'selective-srt' ? (
+                          <>
+                            <Check className="h-3.5 w-3.5 text-emerald-400" />
+                            <span>Kopyalandı</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3.5 w-3.5 text-[#94A3B8]" />
+                            <span>Kopyala</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleDownloadSelectiveSrt}
+                        className="flex items-center gap-1.5 whitespace-nowrap rounded-md bg-[#D99B26] px-3 py-1.5 text-xs font-semibold text-[#0B0F17] transition-colors hover:bg-[#E5AA38]"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        <span>Seçme .SRT İndir</span>
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {selectiveViewMode === 'style' ? (
+                <SubtitleStyleEditor
+                  style={subtitleStyle}
+                  onChange={onChangeSubtitleStyle}
+                  sampleSource={selectiveEntries[0]?.source || 'Kral'}
+                  sampleText={
+                    selectiveEntries[0]?.text ||
+                    '"Bu topraklarda hakikat, kılıçtan daha uzun yaşar."'
+                  }
+                />
+              ) : selectiveEntries.length === 0 ? (
+                <div className="flex min-h-[380px] flex-col items-center justify-center text-center">
+                  <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-md border border-white/[0.08] bg-[#0B0F17] text-[#64748B]">
+                    {isExtractingSelective ? (
+                      <Loader2 className="h-5 w-5 animate-spin text-[#D99B26]" />
+                    ) : (
+                      <MessageSquareQuote className="h-5 w-5" />
+                    )}
+                  </div>
+                  <h2 className="text-sm font-medium text-[#E2E8F0]">
+                    {isExtractingSelective
+                      ? selectiveProgress?.message || 'Hydrogen diyalog ve ayetleri arıyor...'
+                      : 'Seçme diyalog ve ayet satırları burada görünecek'}
+                  </h2>
+                  <p className="mt-1.5 max-w-md text-xs leading-relaxed text-[#64748B]">
+                    {isExtractingSelective
+                      ? 'Uzun transkriptler 20 dakikalık bloklarda taranır; bulunan diyalog ve ayetler anlık olarak buraya eklenir.'
+                      : 'Soldaki "3. Seçme Altyazı" bölümünden Hydrogen ile otomatik ayıklama başlatabilir ya da "+ Satır Ekle" ile elle ekleyebilirsiniz.'}
+                  </p>
+                </div>
+              ) : selectiveViewMode === 'srt' ? (
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between text-[11px] text-[#94A3B8]">
+                    <span>
+                      Kaynak etiketi:{' '}
+                      <strong className="text-[#E2E8F0]">
+                        {subtitleStyle.includeSourcePrefix ? 'Açık (Kaynak: Metin)' : 'Kapalı (Sadece Metin)'}
+                      </strong>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onChangeSubtitleStyle({
+                          ...subtitleStyle,
+                          includeSourcePrefix: !subtitleStyle.includeSourcePrefix,
+                        })
+                      }
+                      className="text-[#D99B26] underline underline-offset-4 hover:text-[#E5AA38]"
+                    >
+                      {subtitleStyle.includeSourcePrefix ? 'Kaynak Etiketini Gizle' : 'Kaynak Etiketini Göster'}
+                    </button>
+                  </div>
+                  <textarea
+                    readOnly
+                    value={selectiveSrtText}
+                    rows={18}
+                    className="w-full rounded-md border border-white/[0.07] bg-[#0B0F17]/70 p-4 font-mono text-xs leading-relaxed text-[#CBD5E1] focus:border-[#D99B26]/50 focus:outline-none"
+                  />
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {/* Inline Quick Source Prefix & Style Hint Strip */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-white/[0.07] bg-[#0B0F17]/60 px-3 py-2 text-[11px] text-[#94A3B8]">
+                    <span>
+                      Her satırın kaynağını, zamanını ve metnini doğrudan düzeltebilirsiniz.
+                    </span>
+                    <div className="flex items-center gap-3">
+                      <label className="flex cursor-pointer items-center gap-1.5 text-[#CBD5E1]">
+                        <input
+                          type="checkbox"
+                          checked={subtitleStyle.includeSourcePrefix}
+                          onChange={(e) =>
+                            onChangeSubtitleStyle({
+                              ...subtitleStyle,
+                              includeSourcePrefix: e.target.checked,
+                            })
+                          }
+                          className="accent-[#D99B26]"
+                        />
+                        <span>Kaynak öneki göster</span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setSelectiveViewMode('style')}
+                        className="text-[#D99B26] underline underline-offset-4 hover:text-[#E5AA38]"
+                      >
+                        Font &amp; Stil Ayarla
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Editable Rows List */}
+                  <div className="max-h-[460px] divide-y divide-white/[0.06] overflow-y-auto rounded-md border border-white/[0.07] bg-[#0B0F17]/60">
+                    {selectiveEntries.map((entry, idx) => {
+                      const startVal =
+                        selectiveTimeDrafts[entry.id]?.start ?? formatMMSS(entry.startSec);
+                      const endVal =
+                        selectiveTimeDrafts[entry.id]?.end ?? formatMMSS(entry.endSec);
+                      const isPlayingHere =
+                        currentPlaySec >= entry.startSec && currentPlaySec <= entry.endSec;
+
+                      return (
+                        <div
+                          key={entry.id}
+                          className={`space-y-2.5 p-3.5 transition-colors ${
+                            isPlayingHere ? 'bg-[#D99B26]/[0.07]' : 'hover:bg-white/[0.015]'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-mono text-xs font-semibold tabular-nums text-[#D99B26]">
+                                #{idx + 1}
+                              </span>
+
+                              {audioObjectUrl && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSeekTo(entry.startSec)}
+                                  title="Bu saniyeden dinle"
+                                  className="flex h-6 w-6 items-center justify-center rounded border border-white/[0.1] bg-[#131924] text-[#CBD5E1] transition-colors hover:border-[#D99B26]/50 hover:text-[#D99B26]"
+                                >
+                                  <Play className="h-3 w-3 fill-current" />
+                                </button>
+                              )}
+
+                              <div className="flex items-center gap-1 font-mono text-[11px]">
+                                <input
+                                  type="text"
+                                  aria-label="Başlangıç zamanı"
+                                  value={startVal}
+                                  onChange={(e) =>
+                                    setSelectiveTimeDrafts((prev) => ({
+                                      ...prev,
+                                      [entry.id]: { ...prev[entry.id], start: e.target.value },
+                                    }))
+                                  }
+                                  onBlur={() => handleCommitSelectiveTime(entry.id, 'start')}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') e.currentTarget.blur();
+                                  }}
+                                  className="w-16 rounded border border-white/[0.1] bg-[#131924] px-1.5 py-0.5 text-center tabular-nums text-[#F1F5F9] focus:border-[#D99B26]/60 focus:outline-none"
+                                />
+                                <span className="text-[#64748B]">–</span>
+                                <input
+                                  type="text"
+                                  aria-label="Bitiş zamanı"
+                                  value={endVal}
+                                  onChange={(e) =>
+                                    setSelectiveTimeDrafts((prev) => ({
+                                      ...prev,
+                                      [entry.id]: { ...prev[entry.id], end: e.target.value },
+                                    }))
+                                  }
+                                  onBlur={() => handleCommitSelectiveTime(entry.id, 'end')}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') e.currentTarget.blur();
+                                  }}
+                                  className="w-16 rounded border border-white/[0.1] bg-[#131924] px-1.5 py-0.5 text-center tabular-nums text-[#F1F5F9] focus:border-[#D99B26]/60 focus:outline-none"
+                                />
+                              </div>
+
+                              <select
+                                aria-label="Altyazı türü"
+                                value={entry.kind}
+                                onChange={(e) =>
+                                  handleUpdateSelectiveEntry(entry.id, {
+                                    kind: e.target.value as DialogueSubtitleKind,
+                                  })
+                                }
+                                className="rounded border border-white/[0.1] bg-[#131924] px-2 py-0.5 text-[11px] text-[#CBD5E1] focus:border-[#D99B26]/60 focus:outline-none"
+                              >
+                                <option value="diyalog">Diyalog</option>
+                                <option value="ayet">Ayet</option>
+                                <option value="alinti">Alıntı</option>
+                              </select>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteSelectiveEntry(entry.id)}
+                              title="Bu altyazı satırını sil"
+                              className="rounded p-1 text-[#64748B] transition-colors hover:bg-rose-500/10 hover:text-rose-400"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+
+                          <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+                            <div className="sm:col-span-4">
+                              <input
+                                type="text"
+                                value={entry.source}
+                                onChange={(e) =>
+                                  handleUpdateSelectiveEntry(entry.id, { source: e.target.value })
+                                }
+                                placeholder="Kaynak / Ayet (örn. Kral, Bakara: 15, Matta 5:9 — boş=sadece metin)"
+                                className="w-full rounded border border-white/[0.1] bg-[#131924] px-2.5 py-1.5 text-xs font-medium text-[#FDE68A] placeholder-[#475569] focus:border-[#D99B26]/60 focus:outline-none"
+                              />
+                            </div>
+                            <div className="sm:col-span-8">
+                              <textarea
+                                rows={2}
+                                value={entry.text}
+                                onChange={(e) =>
+                                  handleUpdateSelectiveEntry(entry.id, { text: e.target.value })
+                                }
+                                placeholder="Altyazı metni..."
+                                className="w-full rounded border border-white/[0.1] bg-[#131924] px-2.5 py-1.5 text-xs leading-relaxed text-[#F1F5F9] placeholder-[#475569] focus:border-[#D99B26]/60 focus:outline-none"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Bottom 1-Click Handoff to Step 1 Documentary Editor */}
-          {(segments.length > 0 || scenePlan.length > 0) && (
+          {(segments.length > 0 || scenePlan.length > 0 || selectiveEntries.length > 0) && (
             <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.07] pt-4 text-xs text-[#64748B]">
               <span>
-                {scenePlan.length > 0
-                  ? 'Üretilen sahne süre planını (.TXT) ve transkripti (.SRT) tek tıkla Kurgu Adım 1’e aktarın; ardından numaralı görselleri bırakmanız yeterli.'
-                  : 'Bu transkripti doğrudan Kurgu Adım 1’e aktarabilirsiniz.'}
+                {selectiveEntries.length > 0
+                  ? `Hazırlanan ${selectiveEntries.length} satırlık seçme altyazı ve stil ayarları doğrudan Kurgu & Render paketine aktarılır.`
+                  : scenePlan.length > 0
+                    ? 'Üretilen sahne süre planını (.TXT) ve transkripti (.SRT) tek tıkla Kurgu Adım 1’e aktarın; ardından numaralı görselleri bırakmanız yeterli.'
+                    : 'Bu transkripti doğrudan Kurgu Adım 1’e aktarabilirsiniz.'}
               </span>
               <button
                 type="button"
@@ -1233,15 +1818,20 @@ export const StandaloneTranscriber: React.FC<StandaloneTranscriberProps> = ({
                     audioFile,
                     audioDuration,
                     scenePlan.length > 0 ? scenePlan : undefined,
-                    scenePlan.length > 0 ? `${baseName}_sahne_plani_ve_promptlar.txt` : undefined
+                    scenePlan.length > 0 ? `${baseName}_sahne_plani_ve_promptlar.txt` : undefined,
+                    selectiveEntries.length > 0 ? selectiveEntries : undefined
                   )
                 }
                 className="flex items-center gap-1.5 whitespace-nowrap rounded-md border border-[#D99B26]/40 bg-[#D99B26]/10 px-3 py-1.5 font-medium text-[#F1F5F9] transition-colors hover:bg-[#D99B26]/20 disabled:opacity-50"
               >
                 <span>
-                  {scenePlan.length > 0
-                    ? "Plan + Transkripti Adım 1'e Aktar"
-                    : "Transkripti Adım 1'e Aktar"}
+                  {scenePlan.length > 0 && selectiveEntries.length > 0
+                    ? "Plan + Seçme Altyazıyı Adım 1'e Aktar"
+                    : selectiveEntries.length > 0
+                      ? "Seçme Altyazıyı Adım 1'e Aktar"
+                      : scenePlan.length > 0
+                        ? "Plan + Transkripti Adım 1'e Aktar"
+                        : "Transkripti Adım 1'e Aktar"}
                 </span>
                 <ArrowRight className="h-3.5 w-3.5 text-[#D99B26]" />
               </button>

@@ -29,6 +29,58 @@ export interface GeneratedScenePlanItem extends TimingPlanEntry {
   imagePrompt: string;
 }
 
+export type DialogueSubtitleKind = 'diyalog' | 'ayet' | 'alinti';
+
+export interface DialogueSubtitleEntry {
+  id: string;
+  startSec: number;
+  endSec: number;
+  source: string; // e.g. "Kral", "Rahip", "Kur'an Ayeti", "Tevrat", "İncil"
+  text: string;
+  kind: DialogueSubtitleKind;
+}
+
+export type SubtitleFontFamily =
+  | 'Arial'
+  | 'Georgia'
+  | 'Times New Roman'
+  | 'Trebuchet MS'
+  | 'Verdana'
+  | 'Calibri'
+  | 'Segoe UI';
+
+export type SubtitleBgMode = 'box' | 'outline' | 'none';
+export type SubtitlePosition = 'bottom' | 'lower_mid' | 'center';
+export type SubtitleSourceMode = 'selective' | 'full';
+
+export interface SubtitleStyleConfig {
+  fontName: SubtitleFontFamily;
+  fontSize: number; // ASS logical font size at 1080p (16..34)
+  bold: boolean;
+  italic: boolean;
+  textColor: string; // Hex color e.g. #FFFFFF
+  backgroundMode: SubtitleBgMode;
+  backgroundColor: string; // Hex color e.g. #000000
+  backgroundOpacity: number; // 0..100
+  outlineWidth: number; // 0..4
+  position: SubtitlePosition;
+  includeSourcePrefix: boolean; // Prepends "Kaynak: " before subtitle line
+}
+
+export const DEFAULT_SUBTITLE_STYLE: SubtitleStyleConfig = {
+  fontName: 'Georgia',
+  fontSize: 22,
+  bold: false,
+  italic: false,
+  textColor: '#FEF3C7',
+  backgroundMode: 'box',
+  backgroundColor: '#000000',
+  backgroundOpacity: 72,
+  outlineWidth: 2,
+  position: 'bottom',
+  includeSourcePrefix: true,
+};
+
 export interface TimelineScene {
   id: string;
   orderNumber: number;
@@ -84,6 +136,9 @@ export interface PersistedSession {
   totalAudioDuration: number;
   zoomSpeedPerSec: number;
   burnSubtitles: boolean;
+  subtitleSourceMode?: SubtitleSourceMode;
+  subtitleStyle?: SubtitleStyleConfig;
+  selectiveSubtitles?: DialogueSubtitleEntry[];
   alignmentModelUsed: string;
   transcriptSegments: TranscriptSegment[];
   scenes: TimelineScene[];

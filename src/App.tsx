@@ -1,10 +1,14 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   DEFAULT_EDITOR_SETTINGS,
+  DEFAULT_SUBTITLE_STYLE,
   DEFAULT_ZOOM_SPEED_PER_SEC,
+  DialogueSubtitleEntry,
   EditorSettings,
   GeneratedScenePlanItem,
   PersistedSession,
+  SubtitleSourceMode,
+  SubtitleStyleConfig,
   TimelineScene,
   TimingPlanEntry,
   TranscriptSegment,
@@ -12,6 +16,7 @@ import {
   WizardStep,
 } from './types/editor';
 import {
+  dialogueEntriesToSegments,
   parseSrtToSegments,
   parseTimingPlanTxt,
   readAudioDuration,
@@ -107,6 +112,20 @@ export default function App() {
   const [burnSubtitles, setBurnSubtitles] = useState<boolean>(
     Boolean(saved?.burnSubtitles)
   );
+  const [selectiveSubtitles, setSelectiveSubtitles] = useState<DialogueSubtitleEntry[]>(
+    Array.isArray(saved?.selectiveSubtitles) ? saved.selectiveSubtitles : []
+  );
+  const [subtitleSourceMode, setSubtitleSourceMode] = useState<SubtitleSourceMode>(
+    saved?.subtitleSourceMode === 'selective' || saved?.subtitleSourceMode === 'full'
+      ? saved.subtitleSourceMode
+      : Array.isArray(saved?.selectiveSubtitles) && saved.selectiveSubtitles.length > 0
+        ? 'selective'
+        : 'full'
+  );
+  const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyleConfig>({
+    ...DEFAULT_SUBTITLE_STYLE,
+    ...(saved?.subtitleStyle || {}),
+  });
   const [alignmentModelUsed, setAlignmentModelUsed] = useState<string>(
     saved?.alignmentModelUsed || ''
   );
@@ -150,6 +169,9 @@ export default function App() {
         totalAudioDuration,
         zoomSpeedPerSec,
         burnSubtitles,
+        subtitleSourceMode,
+        subtitleStyle,
+        selectiveSubtitles,
         alignmentModelUsed,
         transcriptSegments,
         scenes,
@@ -164,6 +186,9 @@ export default function App() {
     totalAudioDuration,
     zoomSpeedPerSec,
     burnSubtitles,
+    subtitleSourceMode,
+    subtitleStyle,
+    selectiveSubtitles,
     alignmentModelUsed,
     transcriptSegments,
     scenes,
@@ -536,6 +561,8 @@ export default function App() {
     handleClearTimingPlan();
     setTotalAudioDuration(0);
     setTranscriptSegments([]);
+    setSelectiveSubtitles([]);
+    setSubtitleSourceMode('full');
     setScenes([]);
     setAlignmentModelUsed('');
     setBurnSubtitles(false);
@@ -551,10 +578,65 @@ export default function App() {
     }
   };
 
+  const handleUploadCustomSelectiveSrt = async (file: File) => {
+    try {
+      const raw = await file.text();
+      const parsed = parseSrtToSegments(raw);
+      if (parsed.length === 0) return;
+      const converted: DialogueSubtitleEntry[] = parsed.map((seg, idx) => {
+        const colonIdx = seg.text.indexOf(':');
+        const hasPrefix = colonIdx > 0 && colonIdx <= 32;
+        return {
+          id: `custom_srt_${Date.now()}_${idx}`,
+          startSec: seg.startSec,
+          endSec: seg.endSec,
+          kind: 'diyalog',
+          source: hasPrefix ? seg.text.slice(0, colonIdx).trim() : '',
+          text: hasPrefix ? seg.text.slice(colonIdx + 1).trim() : seg.text.trim(),
+        };
+      });
+      setSelectiveSubtitles(converted);
+      setSubtitleSourceMode('selective');
+      setBurnSubtitles(true);
+    } catch {
+      // ignore invalid custom srt
+    }
+  };
+
+  const activeSubtitleSegments = useMemo<TranscriptSegment[]>(() => {
+    if (subtitleSourceMode === 'selective' && selectiveSubtitles.length > 0) {
+      return dialogueEntriesToSegments(selectiveSubtitles, subtitleStyle.includeSourcePrefix);
+    }
+    if (transcriptSegments.length > 0) {
+      return transcriptSegments;
+    }
+    if (selectiveSubtitles.length > 0) {
+      return dialogueEntriesToSegments(selectiveSubtitles, subtitleStyle.includeSourcePrefix);
+    }
+    return [];
+  }, [
+    subtitleSourceMode,
+    selectiveSubtitles,
+    subtitleStyle.includeSourcePrefix,
+    transcriptSegments,
+  ]);
+
+  const activeSubtitleSourceLabel =
+    subtitleSourceMode === 'selective' && selectiveSubtitles.length > 0
+      ? 'Seçme'
+      : transcriptSegments.length > 0
+        ? 'Tam'
+        : undefined;
+
   const canAccessStep2 = scenes.length > 0;
   const canAccessStep3 = scenes.length > 0;
   const hasAnyData = Boolean(
-    audioFileName || srtFileName || timingPlanFileName || images.length > 0 || scenes.length > 0
+    audioFileName ||
+      srtFileName ||
+      timingPlanFileName ||
+      images.length > 0 ||
+      scenes.length > 0 ||
+      selectiveSubtitles.length > 0
   );
 
   const handleUseStandaloneTranscriptInEditor = (
@@ -563,10 +645,18 @@ export default function App() {
     sourceAudioFile: File | null,
     durationSec: number,
     generatedPlan?: GeneratedScenePlanItem[],
-    planFileName?: string
+    planFileName?: string,
+    extractedSelective?: DialogueSubtitleEntry[]
   ) => {
-    setSrtFileName(sourceSrtName);
-    setSrtSegments(extractedSegments);
+    if (extractedSegments.length > 0) {
+      setSrtFileName(sourceSrtName);
+      setSrtSegments(extractedSegments);
+    }
+    if (extractedSelective && extractedSelective.length > 0) {
+      setSelectiveSubtitles(extractedSelective);
+      setSubtitleSourceMode('selective');
+      setBurnSubtitles(true);
+    }
     if (generatedPlan && generatedPlan.length > 0) {
       setTimingPlanEntries(generatedPlan);
       setTimingPlanFileName(planFileName || 'sahne_plani_ve_promptlar.txt');
@@ -602,6 +692,8 @@ export default function App() {
           <StandaloneTranscriber
             settings={settings}
             hasDeepgramKey={hasDeepgramKey}
+            subtitleStyle={subtitleStyle}
+            onChangeSubtitleStyle={setSubtitleStyle}
             onOpenSettings={() => setSettingsOpen(true)}
             onUseTranscriptInEditor={handleUseStandaloneTranscriptInEditor}
           />
@@ -644,11 +736,14 @@ export default function App() {
             totalAudioDuration={totalAudioDuration}
             zoomSpeedPerSec={zoomSpeedPerSec}
             burnSubtitles={burnSubtitles}
+            subtitleStyle={subtitleStyle}
+            subtitleSourceLabel={activeSubtitleSourceLabel}
             alignmentModelUsed={alignmentModelUsed}
             isRealigning={isRealigning}
             realignRetryNotice={realignRetryNotice}
             realignError={realignError}
             transcriptSegments={transcriptSegments}
+            activeSubtitleSegments={activeSubtitleSegments}
             scenes={scenes}
             images={images}
             onChangeZoomSpeed={handleChangeZoomSpeed}
@@ -669,9 +764,16 @@ export default function App() {
             zoomSpeedPerSec={zoomSpeedPerSec}
             burnSubtitles={burnSubtitles}
             transcriptSegments={transcriptSegments}
+            selectiveSubtitles={selectiveSubtitles}
+            subtitleSourceMode={subtitleSourceMode}
+            subtitleStyle={subtitleStyle}
+            activeSubtitleSegments={activeSubtitleSegments}
             scenes={scenes}
             onChangeAudioFileName={setAudioFileName}
             onToggleSubtitles={setBurnSubtitles}
+            onChangeSubtitleSourceMode={setSubtitleSourceMode}
+            onChangeSubtitleStyle={setSubtitleStyle}
+            onUploadCustomSelectiveSrt={(file) => void handleUploadCustomSelectiveSrt(file)}
             onBackToTimeline={() => setActiveStep(2)}
           />
         )}
